@@ -397,8 +397,8 @@ export default function AccountList() {
                     <td className="p-4 text-xs text-[var(--muted-foreground)]">{formatDate(account.lastLoginAt || account.lastUsedAt)}</td>
                     <td className="p-4">
                       <div className="flex gap-1">
-                        {account.provider.startsWith("kiro") && (
-                          <Button variant="ghost" size="icon" onClick={() => handleOpenPanel(account.id)} title="Open Kiro Panel">
+                        {(account.provider.startsWith("kiro") || account.provider === "qoder") && (
+                          <Button variant="ghost" size="icon" onClick={() => handleOpenPanel(account.id)} title={`Open ${account.provider === "qoder" ? "Qoder" : "Kiro"} Panel`}>
                             <ExternalLink className="w-4 h-4 text-[var(--info)]" />
                           </Button>
                         )}

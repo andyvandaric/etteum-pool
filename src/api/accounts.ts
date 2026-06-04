@@ -646,7 +646,8 @@ async function handleCodexInstantLogin(c: any, tokens: string[]) {
 }
 
 /**
- * POST /api/accounts/:id/open-panel - Open Kiro web panel in browser with auto-login
+ * POST /api/accounts/:id/open-panel - Open web panel in browser with auto-login
+ * Supports: kiro, kiro-pro, qoder
  */
 accountsRouter.post("/:id/open-panel", async (c) => {
   const id = Number(c.req.param("id"));
@@ -659,81 +660,147 @@ accountsRouter.post("/:id/open-panel", async (c) => {
     return c.json({ error: "Account not found" }, 404);
   }
 
-  if (!account.provider.startsWith("kiro")) {
-    return c.json({ error: "Open panel only supported for kiro/kiro-pro accounts" }, 400);
-  }
-
   const tokens = typeof account.tokens === "string"
     ? JSON.parse(account.tokens)
     : account.tokens;
 
-  if (!tokens?.refresh_token) {
-    return c.json({ error: "No refresh token available" }, 400);
+  if (!tokens) {
+    return c.json({ error: "No tokens available" }, 400);
   }
 
-  // Refresh to get fresh access token
-  const refreshResp = await fetch("https://prod.us-east-1.auth.desktop.kiro.dev/refreshToken", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ refreshToken: tokens.refresh_token }),
-  });
-
-  if (!refreshResp.ok) {
-    return c.json({ error: `Token refresh failed: ${refreshResp.status}` }, 500);
-  }
-
-  const refreshData = (await refreshResp.json()) as {
-    accessToken?: string;
-    refreshToken?: string;
-    profileArn?: string;
-  };
-
-  const accessToken = refreshData.accessToken;
-  const refreshToken = refreshData.refreshToken || tokens.refresh_token;
-  const profileArn = tokens.profile_arn || tokens.profileArn || refreshData.profileArn || "";
-
-  // Extract userId from getUsageLimits response (cached in metadata or from profileArn)
-  const meta = (account.metadata || {}) as Record<string, unknown>;
-  let userId = (meta.kiroUserId as string) || "";
-  if (!userId) {
-    // Try to fetch userId from getUsageLimits
-    try {
-      const url = new URL("https://q.us-east-1.amazonaws.com/getUsageLimits");
-      url.searchParams.set("origin", "AI_EDITOR");
-      url.searchParams.set("resourceType", "AGENTIC_REQUEST");
-      url.searchParams.set("profileArn", profileArn);
-      const usageResp = await fetch(url.toString(), {
-        headers: {
-          Accept: "application/json",
-          Authorization: `Bearer ${accessToken}`,
-          "User-Agent": "KiroIDE/compatible pool-proxy/1.0.0",
-        },
-      });
-      if (usageResp.ok) {
-        const usageData = (await usageResp.json()) as { userInfo?: { userId?: string } };
-        userId = usageData.userInfo?.userId || "";
-      }
-    } catch { /* ignore */ }
-  }
-
-  // Spawn Playwright browser with cookies injected
   try {
     const { chromium } = await import("playwright");
     const browser = await chromium.launch({ headless: false });
     const context = await browser.newContext();
 
-    await context.addCookies([
-      { name: "AccessToken", value: accessToken || "", domain: "app.kiro.dev", path: "/" },
-      { name: "RefreshToken", value: refreshToken, domain: "app.kiro.dev", path: "/" },
-      { name: "UserId", value: userId, domain: "app.kiro.dev", path: "/" },
-      { name: "Idp", value: "Google", domain: "app.kiro.dev", path: "/" },
-    ]);
+    if (account.provider.startsWith("kiro")) {
+      if (!tokens.refresh_token) {
+        await browser.close();
+        return c.json({ error: "No refresh token available" }, 400);
+      }
 
-    const page = await context.newPage();
-    await page.goto("https://app.kiro.dev/settings/account");
+      // Refresh to get fresh access token
+      const refreshResp = await fetch("https://prod.us-east-1.auth.desktop.kiro.dev/refreshToken", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ refreshToken: tokens.refresh_token }),
+      });
 
-    return c.json({ success: true, message: `Browser opened for ${account.email}` });
+      if (!refreshResp.ok) {
+        await browser.close();
+        return c.json({ error: `Token refresh failed: ${refreshResp.status}` }, 500);
+      }
+
+      const refreshData = (await refreshResp.json()) as {
+        accessToken?: string;
+        refreshToken?: string;
+        profileArn?: string;
+      };
+
+      const accessToken = refreshData.accessToken;
+      const refreshToken = refreshData.refreshToken || tokens.refresh_token;
+      const profileArn = tokens.profile_arn || tokens.profileArn || refreshData.profileArn || "";
+
+      // Extract userId from getUsageLimits response (cached in metadata or from profileArn)
+      const meta = (account.metadata || {}) as Record<string, unknown>;
+      let userId = (meta.kiroUserId as string) || "";
+      if (!userId) {
+        // Try to fetch userId from getUsageLimits
+        try {
+          const url = new URL("https://q.us-east-1.amazonaws.com/getUsageLimits");
+          url.searchParams.set("origin", "AI_EDITOR");
+          url.searchParams.set("resourceType", "AGENTIC_REQUEST");
+          url.searchParams.set("profileArn", profileArn);
+          const usageResp = await fetch(url.toString(), {
+            headers: {
+              Accept: "application/json",
+              Authorization: `Bearer ${accessToken}`,
+              "User-Agent": "KiroIDE/compatible pool-proxy/1.0.0",
+            },
+          });
+          if (usageResp.ok) {
+            const usageData = (await usageResp.json()) as { userInfo?: { userId?: string } };
+            userId = usageData.userInfo?.userId || "";
+          }
+        } catch { /* ignore */ }
+      }
+
+      await context.addCookies([
+        { name: "AccessToken", value: accessToken || "", domain: "app.kiro.dev", path: "/" },
+        { name: "RefreshToken", value: refreshToken, domain: "app.kiro.dev", path: "/" },
+        { name: "UserId", value: userId, domain: "app.kiro.dev", path: "/" },
+        { name: "Idp", value: "Google", domain: "app.kiro.dev", path: "/" },
+      ]);
+
+      const page = await context.newPage();
+      await page.goto("https://app.kiro.dev/settings/account");
+
+      return c.json({ success: true, message: `Browser opened for ${account.email}` });
+    } else if (account.provider === "qoder") {
+      // Qoder: inject stored web cookies
+      const webCookie = tokens.web_cookie as string | undefined;
+      if (!webCookie) {
+        await browser.close();
+        return c.json({ error: "No web_cookie available for Qoder account" }, 400);
+      }
+
+      // Parse cookie string into array
+      const cookies = webCookie.split("; ").map((pair) => {
+        const idx = pair.indexOf("=");
+        if (idx === -1) return null;
+        const name = pair.slice(0, idx);
+        const value = pair.slice(idx + 1);
+        return { name, value };
+      }).filter((c): c is { name: string; value: string } => c !== null);
+
+      // Filter to qoder.com-relevant cookies and add domain
+      const qoderCookies = cookies
+        .filter((c) => {
+          // Include qoder-specific cookies
+          if (c.name.startsWith("qoder_") || c.name === "tfstk" || c.name === "cbc" || c.name === "test_cookie") {
+            return true;
+          }
+          // Include tracking cookies
+          if (c.name.startsWith("_ga") || c.name.startsWith("_gcl") || c.name.startsWith("_nb")) {
+            return true;
+          }
+          // Include other misc cookies
+          if (c.name === "OTZ" || c.name.startsWith("_c_")) {
+            return true;
+          }
+          return false;
+        })
+        .map((c) => ({
+          name: c.name,
+          value: c.value,
+          domain: "qoder.com",
+          path: "/",
+        }));
+
+      if (qoderCookies.length === 0) {
+        await browser.close();
+        return c.json({ error: "No valid Qoder cookies found in web_cookie" }, 400);
+      }
+
+      await context.addCookies(qoderCookies);
+
+      const page = await context.newPage();
+      await page.goto("https://qoder.com/account/profile");
+
+      return c.json({
+        success: true,
+        message: `Browser opened for ${account.email}`,
+        cookiesInjected: qoderCookies.length,
+      });
+    } else {
+      await browser.close();
+      return c.json({
+        error: `Open panel not supported for provider: ${account.provider}`,
+      }, 400);
+    }
   } catch (error) {
-    return c.json({ error: `Failed to open browser: ${error instanceof Error ? error.message : String(error)}` }, 500);
+    return c.json({
+      error: `Failed to open browser: ${error instanceof Error ? error.message : String(error)}`,
+    }, 500);
   }
 });
