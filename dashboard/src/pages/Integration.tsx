@@ -1,11 +1,12 @@
 import { useState, useEffect, useCallback, useRef } from "react";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
-import { Plug, Copy, Check, Terminal, ArrowRight, Search, ChevronsUpDown } from "lucide-react";
+import { Plug, Copy, Check, Terminal, ArrowRight, Search, ChevronsUpDown, Zap } from "lucide-react";
 import {
   fetchIntegration,
   saveIntegration,
   fetchApiKey,
+  applyIntegrationConfig,
   API_BASE,
   type ModelMappingDTO,
 } from "@/lib/api";
@@ -175,6 +176,7 @@ export default function Integration() {
   const [apiKey, setApiKey] = useState("");
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
+  const [applying, setApplying] = useState(false);
   const { message, setMessage } = useTimedMessage<string>(null, 3000);
 
   // ANTHROPIC_BASE_URL points at the proxy root; Claude Code appends /v1/messages.
@@ -225,6 +227,18 @@ export default function Integration() {
       setMessage(e.message || "Save failed");
     } finally {
       setSaving(false);
+    }
+  };
+
+  const handleApplyConfig = async () => {
+    setApplying(true);
+    try {
+      await applyIntegrationConfig(baseUrl);
+      setMessage("Applied configuration to ~/.claude/settings.json");
+    } catch (e: any) {
+      setMessage(e.message || "Failed to apply configuration");
+    } finally {
+      setApplying(false);
     }
   };
 
@@ -281,6 +295,21 @@ export ANTHROPIC_AUTH_TOKEN="${apiKey || "<YOUR_API_KEY>"}"`;
             <pre className="px-3 py-2 rounded-md border border-[var(--border)] bg-[var(--background)] text-xs font-mono text-[var(--foreground)] overflow-x-auto whitespace-pre">
               {envSnippet}
             </pre>
+          </div>
+          <div className="pt-2">
+            <Button onClick={handleApplyConfig} disabled={applying} className="w-full sm:w-auto gap-2">
+              {applying ? (
+                <>Applying...</>
+              ) : (
+                <>
+                  <Zap className="w-4 h-4" />
+                  Apply Config
+                </>
+              )}
+            </Button>
+            <p className="text-xs text-[var(--muted-foreground)] mt-2">
+              Write configuration to ~/.claude/settings.json. This sets up the proxy connection and removes any model overrides.
+            </p>
           </div>
         </CardContent>
       </Card>

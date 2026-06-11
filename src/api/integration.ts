@@ -108,3 +108,75 @@ integrationRouter.put("/", async (c) => {
   const enabled = await getMasterEnabled();
   return c.json({ success: true, enabled, mappings });
 });
+
+/**
+ * POST /api/integration/apply-config - Apply Claude Code configuration to ~/.claude/settings.json
+ * Merges ANTHROPIC_BASE_URL and ANTHROPIC_AUTH_TOKEN into env section, removes model overrides.
+ *
+ * The frontend sends the base URL it already resolved (API_BASE) since the server
+ * may not know its own public-facing address (proxied, tunnelled, etc.).
+ */
+integrationRouter.post("/apply-config", async (c) => {
+  try {
+    const { path: pathMod, os, fs: fsMod } = await import("bun");
+    const fs = await import("node:fs/promises");
+
+    const body = await c.req.json<{ baseUrl?: string }>().catch(() => ({}));
+
+    // Get current API key
+    const apiKeyRow = await db.select().from(settings).where(eq(settings.key, "api_key"));
+    const apiKey = apiKeyRow[0]?.value || process.env.API_KEY || "pool-proxy-secret-key";
+
+    // Use frontend-provided base URL, fall back to localhost with config port
+    const baseUrl = body.baseUrl || `http://localhost:${config.port}`;
+
+    // Target: ~/.claude/settings.json
+    const homeDir = os.homedir();
+    const claudeDir = pathMod.join(homeDir, ".claude");
+    const settingsPath = pathMod.join(claudeDir, "settings.json");
+
+    // Read existing settings or start with empty object
+    let existingSettings: Record<string, unknown> = {};
+    try {
+      const content = await fs.readFile(settingsPath, "utf-8");
+      existingSettings = JSON.parse(content);
+    } catch (err: any) {
+      if (err.code !== "ENOENT") throw err;
+    }
+
+    // Merge env variables — preserve existing, upsert ours
+    const envVars = {
+      ...((existingSettings.env as Record<string, string>) || {}),
+      ANTHROPIC_BASE_URL: baseUrl,
+      ANTHROPIC_AUTH_TOKEN: apiKey,
+    };
+
+    // Remove model overrides so proxy backend handles mapping
+    delete existingSettings.model;
+    delete existingSettings.smallModel;
+
+    // Build new settings
+    const newSettings = {
+      ...existingSettings,
+      env: envVars,
+    };
+
+    // Ensure directory exists and write atomically (write tmp then rename)
+    await fs.mkdir(claudeDir, { recursive: true });
+    const tmpPath = settingsPath + ".tmp";
+    await fs.writeFile(tmpPath, JSON.stringify(newSettings, null, 2) + "\n", "utf-8");
+    await fs.rename(tmpPath, settingsPath);
+
+    return c.json({
+      success: true,
+      path: settingsPath,
+      config: newSettings,
+    });
+  } catch (error: any) {
+    console.error("[Integration] Failed to apply config:", error);
+    return c.json(
+      { success: false, error: error.message || "Failed to apply configuration" },
+      500
+    );
+  }
+});
