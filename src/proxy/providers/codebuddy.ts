@@ -45,6 +45,38 @@ interface CodeBuddyTokens {
   web_cookie?: string;
 }
 
+/** Map cb- prefixed model IDs to the actual CodeBuddy API model names. */
+const CB_MODEL_MAP: Record<string, string> = {
+  // Claude
+  "cb-opus-4.6": "claude-opus-4.6",
+  "cb-opus-4.7": "claude-opus-4.7",
+  "cb-opus-4.8": "claude-opus-4.8",
+  "cb-sonnet-4.6": "claude-sonnet-4.6",
+  "cb-haiku-4.5": "claude-haiku-4.5",
+  // GPT
+  "cb-gpt-5.1": "gpt-5.1",
+  "cb-gpt-5.1-codex": "gpt-5.1-codex",
+  "cb-gpt-5.1-codex-max": "gpt-5.1-codex-max",
+  "cb-gpt-5.1-codex-mini": "gpt-5.1-codex-mini",
+  "cb-gpt-5.2": "gpt-5.2",
+  "cb-gpt-5.2-codex": "gpt-5.2-codex",
+  "cb-gpt-5.3-codex": "gpt-5.3-codex",
+  "cb-gpt-5.4": "gpt-5.4",
+  "cb-gpt-5.5": "gpt-5.5",
+  // Gemini
+  "cb-gemini-2.5-flash": "gemini-2.5-flash",
+  "cb-gemini-2.5-pro": "gemini-2.5-pro",
+  "cb-gemini-3.0-flash": "gemini-3.0-flash",
+  "cb-gemini-3.1-flash-lite": "gemini-3.1-flash-lite",
+  "cb-gemini-3.1-pro": "gemini-3.1-pro",
+  // DeepSeek
+  "cb-deepseek-v3-2": "deepseek-v3-2-volc",
+  // Kimi
+  "cb-kimi-k2.5": "kimi-k2.5",
+  // Other
+  "cb-enowx": "enowx-default",
+};
+
 /**
  * CodeBuddy Provider - MAX tier
  * Supports Claude Opus, GPT-5.x, Gemini, DeepSeek, Kimi models
@@ -53,15 +85,16 @@ export class CodeBuddyProvider extends BaseProvider {
   name = "codebuddy";
 
   override ownsModel(model: string): boolean {
-    const m = model.toLowerCase();
-    return (
-      m.startsWith("cb-") ||
-      m.startsWith("gpt-5") ||
-      m.startsWith("gemini-") ||
-      m.startsWith("kimi-") ||
-      m === "deepseek-v3-2-volc" ||
-      m === "enowx-default"
-    );
+    return model.toLowerCase().startsWith("cb-");
+  }
+
+  /** Resolve cb- prefixed model IDs to actual CodeBuddy API model names. */
+  private resolveModel(model: string): string {
+    // Strip -thinking suffix first for lookup, re-apply after
+    const isThinking = model.endsWith("-thinking");
+    const base = isThinking ? model.replace(/-thinking$/, "") : model;
+    const resolved = CB_MODEL_MAP[base.toLowerCase()] || base;
+    return isThinking ? `${resolved}-thinking` : resolved;
   }
 
   private baseUrl = "https://www.codebuddy.ai";
@@ -74,42 +107,29 @@ export class CodeBuddyProvider extends BaseProvider {
     //   gemini-2.5-pro=$1.25/$10, gemini-flash=$0.30/$2.50, deepseek=$0.14/$0.28
     // 1 CodeBuddy credit ≈ $0.01 passthrough.
 
-    // Claude Opus 4.6 — confirmed: 0.02674/1K
+    // All models exposed with cb- prefix only
+    { id: "cb-opus-4.8", object: "model", created: Date.now(), owned_by: "codebuddy", context_window: 1000000, max_output: 64000, thinking: true, vision: true, creditUnit: "token", creditRate: 0.027 / 1000, creditSource: "estimated" },
+    { id: "cb-opus-4.7", object: "model", created: Date.now(), owned_by: "codebuddy", context_window: 1000000, max_output: 64000, thinking: true, vision: true, creditUnit: "token", creditRate: 0.027 / 1000, creditSource: "estimated" },
     { id: "cb-opus-4.6", object: "model", created: Date.now(), owned_by: "codebuddy", context_window: 1000000, max_output: 64000, thinking: true, vision: true, creditUnit: "token", creditRate: 0.027 / 1000, creditSource: "estimated" },
-    // DeepSeek V3.2 — upstream ~$0.14/$0.28/M → ~0.002/1K
-    { id: "deepseek-v3-2-volc", object: "model", created: Date.now(), owned_by: "codebuddy", thinking: false, vision: false, creditUnit: "token", creditRate: 0.002 / 1000, creditSource: "estimated" },
-    // enowx-default — mid-tier estimate
-    { id: "enowx-default", object: "model", created: Date.now(), owned_by: "codebuddy", thinking: false, vision: true, creditUnit: "token", creditRate: 0.01 / 1000, creditSource: "estimated" },
-    // Gemini 2.5 Flash — upstream ~$0.30/$2.50/M → ~0.003/1K
-    { id: "gemini-2.5-flash", object: "model", created: Date.now(), owned_by: "codebuddy", thinking: true, vision: true, creditUnit: "token", creditRate: 0.003 / 1000, creditSource: "estimated" },
-    // Gemini 2.5 Pro — upstream ~$1.25/$10/M → ~0.012/1K
-    { id: "gemini-2.5-pro", object: "model", created: Date.now(), owned_by: "codebuddy", thinking: true, vision: true, creditUnit: "token", creditRate: 0.012 / 1000, creditSource: "estimated" },
-    // Gemini 3.0 Flash — similar to 2.5 flash → ~0.004/1K
-    { id: "gemini-3.0-flash", object: "model", created: Date.now(), owned_by: "codebuddy", thinking: false, vision: true, creditUnit: "token", creditRate: 0.004 / 1000, creditSource: "estimated" },
-    // Gemini 3.1 Flash Lite — cheapest gemini → ~0.002/1K
-    { id: "gemini-3.1-flash-lite", object: "model", created: Date.now(), owned_by: "codebuddy", thinking: false, vision: true, creditUnit: "token", creditRate: 0.002 / 1000, creditSource: "estimated" },
-    // Gemini 3.1 Pro — upstream ~$2/$12/M → ~0.015/1K
-    { id: "gemini-3.1-pro", object: "model", created: Date.now(), owned_by: "codebuddy", thinking: false, vision: true, creditUnit: "token", creditRate: 0.015 / 1000, creditSource: "estimated" },
-    // GPT-5.1 — upstream ~$1.25/$10/M → ~0.012/1K
-    { id: "gpt-5.1", object: "model", created: Date.now(), owned_by: "codebuddy", thinking: true, vision: true, creditUnit: "token", creditRate: 0.012 / 1000, creditSource: "estimated" },
-    // GPT-5.1 Codex — same tier as 5.1 → ~0.012/1K
-    { id: "gpt-5.1-codex", object: "model", created: Date.now(), owned_by: "codebuddy", thinking: true, vision: true, creditUnit: "token", creditRate: 0.012 / 1000, creditSource: "estimated" },
-    // GPT-5.1 Codex Max — premium codex → ~0.025/1K
-    { id: "gpt-5.1-codex-max", object: "model", created: Date.now(), owned_by: "codebuddy", thinking: true, vision: true, creditUnit: "token", creditRate: 0.025 / 1000, creditSource: "estimated" },
-    // GPT-5.1 Codex Mini — upstream ~$0.25/$2/M → ~0.003/1K
-    { id: "gpt-5.1-codex-mini", object: "model", created: Date.now(), owned_by: "codebuddy", thinking: true, vision: true, creditUnit: "token", creditRate: 0.003 / 1000, creditSource: "estimated" },
-    // GPT-5.2 — upstream ~$1.75/$14/M → ~0.016/1K
-    { id: "gpt-5.2", object: "model", created: Date.now(), owned_by: "codebuddy", thinking: true, vision: true, creditUnit: "token", creditRate: 0.016 / 1000, creditSource: "estimated" },
-    // GPT-5.2 Codex — same as 5.2 → ~0.016/1K
-    { id: "gpt-5.2-codex", object: "model", created: Date.now(), owned_by: "codebuddy", thinking: true, vision: true, creditUnit: "token", creditRate: 0.016 / 1000, creditSource: "estimated" },
-    // GPT-5.3 Codex — upstream ~$2.50/$10/M → ~0.013/1K
-    { id: "gpt-5.3-codex", object: "model", created: Date.now(), owned_by: "codebuddy", thinking: true, vision: true, creditUnit: "token", creditRate: 0.013 / 1000, creditSource: "estimated" },
-    // GPT-5.4 — upstream ~$2.50/$15/M → ~0.018/1K
-    { id: "gpt-5.4", object: "model", created: Date.now(), owned_by: "codebuddy", thinking: true, vision: true, creditUnit: "token", creditRate: 0.018 / 1000, creditSource: "estimated" },
-    // GPT-5.5 — upstream ~$5/$30/M → ~0.035/1K (most expensive GPT)
-    { id: "gpt-5.5", object: "model", created: Date.now(), owned_by: "codebuddy", thinking: true, vision: true, creditUnit: "token", creditRate: 0.035 / 1000, creditSource: "estimated" },
-    // Kimi K2.5 — mid-tier Chinese model → ~0.005/1K
-    { id: "kimi-k2.5", object: "model", created: Date.now(), owned_by: "codebuddy", thinking: false, vision: false, creditUnit: "token", creditRate: 0.005 / 1000, creditSource: "estimated" },
+    { id: "cb-sonnet-4.6", object: "model", created: Date.now(), owned_by: "codebuddy", context_window: 200000, max_output: 64000, thinking: true, vision: true, creditUnit: "token", creditRate: 0.015 / 1000, creditSource: "estimated" },
+    { id: "cb-haiku-4.5", object: "model", created: Date.now(), owned_by: "codebuddy", context_window: 200000, max_output: 8192, thinking: true, vision: true, creditUnit: "token", creditRate: 0.005 / 1000, creditSource: "estimated" },
+    { id: "cb-gpt-5.1", object: "model", created: Date.now(), owned_by: "codebuddy", thinking: true, vision: true, creditUnit: "token", creditRate: 0.012 / 1000, creditSource: "estimated" },
+    { id: "cb-gpt-5.1-codex", object: "model", created: Date.now(), owned_by: "codebuddy", thinking: true, vision: true, creditUnit: "token", creditRate: 0.012 / 1000, creditSource: "estimated" },
+    { id: "cb-gpt-5.1-codex-max", object: "model", created: Date.now(), owned_by: "codebuddy", thinking: true, vision: true, creditUnit: "token", creditRate: 0.025 / 1000, creditSource: "estimated" },
+    { id: "cb-gpt-5.1-codex-mini", object: "model", created: Date.now(), owned_by: "codebuddy", thinking: true, vision: true, creditUnit: "token", creditRate: 0.003 / 1000, creditSource: "estimated" },
+    { id: "cb-gpt-5.2", object: "model", created: Date.now(), owned_by: "codebuddy", thinking: true, vision: true, creditUnit: "token", creditRate: 0.016 / 1000, creditSource: "estimated" },
+    { id: "cb-gpt-5.2-codex", object: "model", created: Date.now(), owned_by: "codebuddy", thinking: true, vision: true, creditUnit: "token", creditRate: 0.016 / 1000, creditSource: "estimated" },
+    { id: "cb-gpt-5.3-codex", object: "model", created: Date.now(), owned_by: "codebuddy", thinking: true, vision: true, creditUnit: "token", creditRate: 0.013 / 1000, creditSource: "estimated" },
+    { id: "cb-gpt-5.4", object: "model", created: Date.now(), owned_by: "codebuddy", thinking: true, vision: true, creditUnit: "token", creditRate: 0.018 / 1000, creditSource: "estimated" },
+    { id: "cb-gpt-5.5", object: "model", created: Date.now(), owned_by: "codebuddy", thinking: true, vision: true, creditUnit: "token", creditRate: 0.035 / 1000, creditSource: "estimated" },
+    { id: "cb-gemini-2.5-flash", object: "model", created: Date.now(), owned_by: "codebuddy", thinking: true, vision: true, creditUnit: "token", creditRate: 0.003 / 1000, creditSource: "estimated" },
+    { id: "cb-gemini-2.5-pro", object: "model", created: Date.now(), owned_by: "codebuddy", thinking: true, vision: true, creditUnit: "token", creditRate: 0.012 / 1000, creditSource: "estimated" },
+    { id: "cb-gemini-3.0-flash", object: "model", created: Date.now(), owned_by: "codebuddy", thinking: false, vision: true, creditUnit: "token", creditRate: 0.004 / 1000, creditSource: "estimated" },
+    { id: "cb-gemini-3.1-flash-lite", object: "model", created: Date.now(), owned_by: "codebuddy", thinking: false, vision: true, creditUnit: "token", creditRate: 0.002 / 1000, creditSource: "estimated" },
+    { id: "cb-gemini-3.1-pro", object: "model", created: Date.now(), owned_by: "codebuddy", thinking: false, vision: true, creditUnit: "token", creditRate: 0.015 / 1000, creditSource: "estimated" },
+    { id: "cb-deepseek-v3-2", object: "model", created: Date.now(), owned_by: "codebuddy", thinking: false, vision: false, creditUnit: "token", creditRate: 0.002 / 1000, creditSource: "estimated" },
+    { id: "cb-kimi-k2.5", object: "model", created: Date.now(), owned_by: "codebuddy", thinking: false, vision: false, creditUnit: "token", creditRate: 0.005 / 1000, creditSource: "estimated" },
+    { id: "cb-enowx", object: "model", created: Date.now(), owned_by: "codebuddy", thinking: false, vision: true, creditUnit: "token", creditRate: 0.01 / 1000, creditSource: "estimated" },
   ];
 
   private getTokens(account: Account): CodeBuddyTokens | null {
@@ -244,7 +264,9 @@ export class CodeBuddyProvider extends BaseProvider {
     }
 
     try {
-      const response = await this.makeRequest(tokens, request, false);
+      // Always request as stream — CodeBuddy no longer supports non-stream responses.
+      // We aggregate the stream into a single ChatCompletionResponse for the client.
+      const response = await this.makeRequest(tokens, request, true);
 
       if (response.status === 401 || response.status === 403) {
         return { success: false, error: "Session expired, re-login required" };
@@ -266,7 +288,20 @@ export class CodeBuddyProvider extends BaseProvider {
         return { success: false, error: `CodeBuddy API error (${response.status}): ${errText}` };
       }
 
-      return this.parseResponse(response, request.model);
+      // Aggregate stream into a single response
+      const data = await this.aggregateStreamResponse(response, request.model);
+      const promptTokens = data.usage.prompt_tokens || 0;
+      const completionTokens = data.usage.completion_tokens || 0;
+      const totalTokens = data.usage.total_tokens || 0;
+      return {
+        success: true,
+        response: data,
+        tokensUsed: totalTokens,
+        promptTokens,
+        completionTokens,
+        creditsUsed: totalTokens > 0 ? totalTokens * this.getProviderCreditRate(request.model) : 0,
+        creditSource: "estimated",
+      };
     } catch (error) {
       return { success: false, error: `CodeBuddy request failed: ${error instanceof Error ? error.message : String(error)}` };
     }
@@ -534,9 +569,10 @@ export class CodeBuddyProvider extends BaseProvider {
       headers["X-CSRF-Token"] = tokens.csrf_token;
     }
 
-    // Handle -thinking suffix
-    const isThinking = request.model.endsWith("-thinking");
-    const actualModel = isThinking ? request.model.replace("-thinking", "") : request.model;
+    // Resolve cb- prefix and handle -thinking suffix
+    const resolved = this.resolveModel(request.model);
+    const isThinking = resolved.endsWith("-thinking");
+    const actualModel = isThinking ? resolved.replace(/-thinking$/, "") : resolved;
 
     // Clean messages: convert Anthropic format to OpenAI format for CodeBuddy API
     // Apply pudidil filters to remove Claude Code CLI detection patterns
@@ -699,79 +735,6 @@ export class CodeBuddyProvider extends BaseProvider {
       headers,
       body: JSON.stringify(body),
     });
-  }
-
-  private async parseResponse(response: Response, model: string): Promise<ProviderResult> {
-    const contentType = response.headers.get("content-type") || "";
-    if (contentType.includes("text/event-stream") || contentType.includes("text/plain")) {
-      const data = await this.aggregateStreamResponse(response, model);
-      const promptTokens = data.usage.prompt_tokens || 0;
-      const completionTokens = data.usage.completion_tokens || 0;
-      const totalTokens = data.usage.total_tokens || 0;
-      return {
-        success: true,
-        response: data,
-        tokensUsed: totalTokens,
-        promptTokens,
-        completionTokens,
-        creditsUsed: totalTokens > 0 ? totalTokens * this.getProviderCreditRate(model) : 0,
-        creditSource: "estimated",
-      };
-    }
-
-    const data = (await response.json()) as any;
-    const completionResponse: ChatCompletionResponse = {
-      id: data.id || this.generateId(),
-      object: "chat.completion",
-      created: data.created || Math.floor(Date.now() / 1000),
-      model,
-      choices: data.choices || [],
-      usage: data.usage || { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
-    };
-
-    const promptTokens = Number(
-      completionResponse.usage.prompt_tokens ||
-      data.usage?.input_tokens ||
-      data.usage?.inputTokens ||
-      0
-    );
-    const completionTokens = Number(
-      completionResponse.usage.completion_tokens ||
-      data.usage?.output_tokens ||
-      data.usage?.outputTokens ||
-      0
-    );
-    const totalTokens = Number(
-      completionResponse.usage.total_tokens ||
-      data.usage?.totalTokens ||
-      data.usage?.total_tokens ||
-      promptTokens + completionTokens ||
-      0
-    );
-    completionResponse.usage = { prompt_tokens: promptTokens, completion_tokens: completionTokens, total_tokens: totalTokens };
-
-    // Extract credits if available from response
-    let creditsUsed = 0;
-    if (typeof data.credits_used === "number") {
-      creditsUsed = data.credits_used;
-    } else if (typeof data.creditsUsed === "number") {
-      creditsUsed = data.creditsUsed;
-    } else if (data.usage?.credits_used) {
-      creditsUsed = Number(data.usage.credits_used);
-    } else {
-      // Fallback: estimate from tokens
-      creditsUsed = totalTokens > 0 ? totalTokens * this.getProviderCreditRate(model) : 0;
-    }
-
-    return {
-      success: true,
-      response: completionResponse,
-      tokensUsed: totalTokens,
-      promptTokens,
-      completionTokens,
-      creditsUsed,
-      creditSource: data.credits_used || data.creditsUsed || data.usage?.credits_used ? "upstream" : "estimated",
-    };
   }
 
   private async aggregateStreamResponse(response: Response, model: string): Promise<ChatCompletionResponse> {
