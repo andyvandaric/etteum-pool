@@ -21,9 +21,9 @@ async function check() {
   console.log(`  Provider: ${account.provider}`);
   console.log(`  Status: ${account.status}`);
   console.log(`  Enabled: ${account.enabled}`);
-  console.log(`  Last Used: ${account.last_used_at}`);
-  console.log(`  Last Login: ${account.last_login_at}`);
-  console.log(`  Updated: ${account.updated_at}`);
+  console.log(`  Last Used: ${account.lastUsedAt}`);
+  console.log(`  Last Login: ${account.lastLoginAt}`);
+  console.log(`  Updated: ${account.updatedAt}`);
   console.log("");
   
   console.log("Tokens:");

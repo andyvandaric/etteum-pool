@@ -9,7 +9,7 @@ import {
 } from "./base";
 import type { Account } from "../../db/schema";
 import { config } from "../../config";
-import { applyPudidilFilters } from "../filters";
+
 
 /**
  * Detect if a system prompt belongs to a known AI agent/CLI tool.
@@ -69,6 +69,7 @@ const CB_MODEL_MAP: Record<string, string> = {
   "cb-gemini-3.0-flash": "gemini-3.0-flash",
   "cb-gemini-3.1-flash-lite": "gemini-3.1-flash-lite",
   "cb-gemini-3.1-pro": "gemini-3.1-pro",
+  "cb-gemini-3.5-flash": "gemini-3.5-flash",
   // DeepSeek
   "cb-deepseek-v3-2": "deepseek-v3-2-volc",
   // Kimi
@@ -83,6 +84,10 @@ const CB_MODEL_MAP: Record<string, string> = {
  */
 export class CodeBuddyProvider extends BaseProvider {
   name = "codebuddy";
+
+  /** Cache for resolved tool schemas — Claude Code sends the same tools every request */
+  private schemaCache = new Map<string, any>();
+  private static readonly SCHEMA_CACHE_MAX = 200;
 
   override ownsModel(model: string): boolean {
     return model.toLowerCase().startsWith("cb-");
@@ -127,6 +132,7 @@ export class CodeBuddyProvider extends BaseProvider {
     { id: "cb-gemini-3.0-flash", object: "model", created: Date.now(), owned_by: "codebuddy", thinking: false, vision: true, creditUnit: "token", creditRate: 0.004 / 1000, creditSource: "estimated" },
     { id: "cb-gemini-3.1-flash-lite", object: "model", created: Date.now(), owned_by: "codebuddy", thinking: false, vision: true, creditUnit: "token", creditRate: 0.002 / 1000, creditSource: "estimated" },
     { id: "cb-gemini-3.1-pro", object: "model", created: Date.now(), owned_by: "codebuddy", thinking: false, vision: true, creditUnit: "token", creditRate: 0.015 / 1000, creditSource: "estimated" },
+    { id: "cb-gemini-3.5-flash", object: "model", created: Date.now(), owned_by: "codebuddy", thinking: true, vision: true, creditUnit: "token", creditRate: 0.004 / 1000, creditSource: "estimated" },
     { id: "cb-deepseek-v3-2", object: "model", created: Date.now(), owned_by: "codebuddy", thinking: false, vision: false, creditUnit: "token", creditRate: 0.002 / 1000, creditSource: "estimated" },
     { id: "cb-kimi-k2.5", object: "model", created: Date.now(), owned_by: "codebuddy", thinking: false, vision: false, creditUnit: "token", creditRate: 0.005 / 1000, creditSource: "estimated" },
     { id: "cb-enowx", object: "model", created: Date.now(), owned_by: "codebuddy", thinking: false, vision: true, creditUnit: "token", creditRate: 0.01 / 1000, creditSource: "estimated" },
@@ -149,12 +155,13 @@ export class CodeBuddyProvider extends BaseProvider {
 
     return tools.map((tool) => {
       // If already in OpenAI format, extract and re-normalize
+      // Note: tool descriptions are already filtered by router.sanitizeRequest()
       if (tool.type === "function" && tool.function) {
         return {
           type: "function",
           function: {
             name: tool.function.name,
-            description: applyPudidilFilters(tool.function.description || ""),
+            description: tool.function.description || "",
             parameters: this.sanitizeToolSchema(tool.function.parameters),
           },
         };
@@ -170,7 +177,7 @@ export class CodeBuddyProvider extends BaseProvider {
         type: "function",
         function: {
           name,
-          description: applyPudidilFilters(description),
+          description,
           parameters: this.sanitizeToolSchema(parameters),
         },
       };
@@ -217,6 +224,12 @@ export class CodeBuddyProvider extends BaseProvider {
       return { type: "object", properties: {} };
     }
 
+    // Cache lookup — Claude Code sends identical tool schemas every request,
+    // so we avoid re-resolving $ref on every call.
+    const cacheKey = JSON.stringify(schema);
+    const cached = this.schemaCache.get(cacheKey);
+    if (cached) return cached;
+
     // Extract $defs/definitions before removing them, so we can resolve $ref inline
     const defs = { ...(schema.$defs || {}), ...(schema.definitions || {}) };
 
@@ -242,6 +255,12 @@ export class CodeBuddyProvider extends BaseProvider {
     if (resolved.required && !Array.isArray(resolved.required)) {
       delete resolved.required;
     }
+
+    // Store in cache (evict all if cache grows too large)
+    if (this.schemaCache.size >= CodeBuddyProvider.SCHEMA_CACHE_MAX) {
+      this.schemaCache.clear();
+    }
+    this.schemaCache.set(cacheKey, resolved);
 
     return resolved;
   }
@@ -593,10 +612,10 @@ export class CodeBuddyProvider extends BaseProvider {
           continue;
         }
 
-        // Simple string content - just apply filters
+        // Simple string content — already filtered by router.sanitizeRequest()
         cleanedMessages.push({
           ...msg,
-          content: applyPudidilFilters(content),
+          content,
         });
         continue;
       }
@@ -627,7 +646,7 @@ export class CodeBuddyProvider extends BaseProvider {
 
           cleanedMessages.push({
             role: msg.role,
-            content: applyPudidilFilters(textContent || ""),
+            content: textContent || "",
             tool_calls: tool_calls.length > 0 ? tool_calls : undefined,
           });
           continue;
@@ -650,7 +669,7 @@ export class CodeBuddyProvider extends BaseProvider {
             cleanedMessages.push({
               role: "tool",
               tool_call_id: toolResult.tool_use_id || crypto.randomUUID(),
-              content: applyPudidilFilters(resultContent),
+              content: resultContent,
             });
           }
 
@@ -663,7 +682,7 @@ export class CodeBuddyProvider extends BaseProvider {
           if (textContent) {
             cleanedMessages.push({
               role: "user",
-              content: applyPudidilFilters(textContent),
+              content: textContent,
             });
           }
           continue;
@@ -680,7 +699,7 @@ export class CodeBuddyProvider extends BaseProvider {
           // Convert Anthropic-style image blocks to OpenAI image_url format
           const openAIBlocks = supportedBlocks.map((block: any) => {
             if (block.type === "text") {
-              return { type: "text", text: applyPudidilFilters(block.text || "") };
+              return { type: "text", text: block.text || "" };
             }
             if (block.type === "image_url") return block;
             // Anthropic format: { type: "image", source: { type: "base64", media_type, data } }
@@ -698,7 +717,7 @@ export class CodeBuddyProvider extends BaseProvider {
             .map((block: any) => block.text || "")
             .filter(Boolean)
             .join("\n");
-          cleanedMessages.push({ ...msg, content: applyPudidilFilters(textContent || "") });
+          cleanedMessages.push({ ...msg, content: textContent || "" });
         }
         continue;
       }
@@ -730,11 +749,15 @@ export class CodeBuddyProvider extends BaseProvider {
       body.reasoning = { effort: "high" };
     }
 
+    // Use a longer timeout for streaming requests — large context (Claude Code)
+    // can cause CodeBuddy to take > 2 minutes before the first token arrives.
+    const timeoutMs = stream ? 300_000 : config.providerRequestTimeoutMs;
+
     return this.fetchWithTimeout(`${this.baseUrl}/v2/chat/completions`, {
       method: "POST",
       headers,
       body: JSON.stringify(body),
-    });
+    }, timeoutMs);
   }
 
   private async aggregateStreamResponse(response: Response, model: string): Promise<ChatCompletionResponse> {
@@ -875,6 +898,8 @@ export class CodeBuddyProvider extends BaseProvider {
     const encoder = new TextEncoder();
     let capturedUsage = { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 };
 
+    const STREAM_READ_TIMEOUT = 300_000; // 5 minutes per read — generous for thinking models
+
     const stream = new ReadableStream<Uint8Array>({
       async start(controller) {
         const reader = response.body?.getReader();
@@ -887,7 +912,12 @@ export class CodeBuddyProvider extends BaseProvider {
 
         try {
           while (true) {
-            const { done, value } = await reader.read();
+            // Race each read against a timeout to detect stalled streams
+            const readPromise = reader.read();
+            const timeoutPromise = new Promise<never>((_, reject) => {
+              setTimeout(() => reject(new Error("Stream read timeout")), STREAM_READ_TIMEOUT);
+            });
+            const { done, value } = await Promise.race([readPromise, timeoutPromise]);
             if (done) break;
 
             buffer += decoder.decode(value, { stream: true });
@@ -977,9 +1007,26 @@ export class CodeBuddyProvider extends BaseProvider {
             if (contentModerationDetected) break;
           }
         } catch (error) {
-          console.error("[CodeBuddy] Stream error:", error);
+          const errMsg = error instanceof Error ? error.message : String(error);
+          console.error("[CodeBuddy] Stream error:", errMsg);
+          // Send an error chunk to the client so it knows what happened
+          try {
+            const errorChunk: StreamChunk = {
+              id, object: "chat.completion.chunk",
+              created: Math.floor(Date.now() / 1000), model,
+              choices: [{
+                index: 0,
+                delta: { content: `\n\n[Stream error: ${errMsg}]` },
+                finish_reason: null,
+              }],
+            };
+            controller.enqueue(encoder.encode(`data: ${JSON.stringify(errorChunk)}\n\n`));
+            controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+          } catch {
+            // Controller may already be closed
+          }
         } finally {
-          controller.close();
+          try { controller.close(); } catch { /* already closed */ }
         }
       },
     });

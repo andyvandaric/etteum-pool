@@ -118,16 +118,18 @@ integrationRouter.put("/", async (c) => {
  */
 integrationRouter.post("/apply-config", async (c) => {
   try {
-    const { path: pathMod, os, fs: fsMod } = await import("bun");
+    const pathMod = await import("node:path");
+    const os = await import("node:os");
     const fs = await import("node:fs/promises");
 
-    const body = await c.req.json<{ baseUrl?: string }>().catch(() => ({}));
+    const body = await c.req.json<{ baseUrl?: string }>().catch((): { baseUrl?: string } => ({}));
 
     // Get current API key
     const apiKeyRow = await db.select().from(settings).where(eq(settings.key, "api_key"));
     const apiKey = apiKeyRow[0]?.value || process.env.API_KEY || "pool-proxy-secret-key";
 
     // Use frontend-provided base URL, fall back to localhost with config port
+    const { config } = await import("../config");
     const baseUrl = body.baseUrl || `http://localhost:${config.port}`;
 
     // Target: ~/.claude/settings.json

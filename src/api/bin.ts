@@ -88,7 +88,7 @@ binApi.get('/lookup/:bin', async (c) => {
       });
 
       if (response.ok) {
-        const data = await response.json();
+        const data = await response.json() as Record<string, any>;
         return c.json({
           success: true,
           data: {

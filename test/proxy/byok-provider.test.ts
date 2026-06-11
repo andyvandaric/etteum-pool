@@ -257,7 +257,7 @@ describe("BYOK Provider", () => {
         .from(accounts)
         .where(eq(accounts.email, "openai-format"))
         .limit(1)
-        .then(rows => rows[0]);
+        .then(rows => rows[0]!);
 
       // The provider should handle this as OpenAI format
       expect(account).toBeDefined();
@@ -286,7 +286,7 @@ describe("BYOK Provider", () => {
         .from(accounts)
         .where(eq(accounts.email, "anthropic-format"))
         .limit(1)
-        .then(rows => rows[0]);
+        .then(rows => rows[0]!);
 
       expect(account).toBeDefined();
       expect(account.tokens).toContain('"format":"auto"');
@@ -314,7 +314,7 @@ describe("BYOK Provider", () => {
         .from(accounts)
         .where(eq(accounts.email, "explicit-format"))
         .limit(1)
-        .then(rows => rows[0]);
+        .then(rows => rows[0]!);
 
       expect(account).toBeDefined();
       expect(account.tokens).toContain('"format":"anthropic"');
@@ -371,7 +371,7 @@ describe("BYOK Provider", () => {
       expect(await provider.ownsModel("temp-provider-temp-model")).toBe(true);
 
       // Remove the provider
-      await db.delete(accounts).where(eq(accounts.id, inserted[0].id));
+      await db.delete(accounts).where(eq(accounts.id, inserted[0]!.id));
       await refreshByokModels();
 
       // Should no longer own the model
@@ -404,7 +404,7 @@ describe("BYOK Provider", () => {
         .from(accounts)
         .where(eq(accounts.email, "encrypted-key"))
         .limit(1)
-        .then(rows => rows[0]);
+        .then(rows => rows[0]!);
 
       // Password should be encrypted in DB
       expect(account.password).not.toBe(testKey);
@@ -439,7 +439,7 @@ describe("BYOK Provider", () => {
         .from(accounts)
         .where(eq(accounts.email, "valid-account"))
         .limit(1)
-        .then(rows => rows[0]);
+        .then(rows => rows[0]!);
 
       const provider = getByokProvider();
       const isValid = await provider.validateAccount(account);
@@ -468,7 +468,7 @@ describe("BYOK Provider", () => {
         .from(accounts)
         .where(eq(accounts.email, "no-base-url"))
         .limit(1)
-        .then(rows => rows[0]);
+        .then(rows => rows[0]!);
 
       const provider = getByokProvider();
       const isValid = await provider.validateAccount(account);
@@ -498,7 +498,7 @@ describe("BYOK Provider", () => {
         .from(accounts)
         .where(eq(accounts.email, "no-models"))
         .limit(1)
-        .then(rows => rows[0]);
+        .then(rows => rows[0]!);
 
       const provider = getByokProvider();
       const isValid = await provider.validateAccount(account);
@@ -530,10 +530,10 @@ describe("BYOK Provider", () => {
         .from(accounts)
         .where(eq(accounts.email, "unlimited"))
         .limit(1)
-        .then(rows => rows[0]);
+        .then(rows => rows[0]!);
 
       const provider = getByokProvider();
-      const quota = await provider.fetchQuota(account);
+      const quota = await provider.fetchQuota();
 
       expect(quota.success).toBe(true);
       expect(quota.quota?.limit).toBe(-1);

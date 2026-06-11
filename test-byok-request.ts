@@ -26,7 +26,7 @@ async function testRequest() {
   const testRequest = {
     model: "genflow-gpt-5.4",
     messages: [
-      { role: "user", content: "Say 'hello'" }
+      { role: "user" as const, content: "Say 'hello'" }
     ],
     max_tokens: 10
   };

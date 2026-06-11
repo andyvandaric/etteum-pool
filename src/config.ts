@@ -12,7 +12,11 @@ export const config = {
     path.join(projectRoot, "scripts/auth/login.py"),
   pythonPath:
     process.env.PYTHON_PATH ||
-    path.join(projectRoot, "scripts/auth/.venv/bin/python"),
+    path.join(
+      projectRoot,
+      "scripts/auth/.venv",
+      process.platform === "win32" ? "Scripts/python.exe" : "bin/python",
+    ),
   authScriptCwd:
     process.env.AUTH_SCRIPT_CWD ||
     path.join(projectRoot, "scripts/auth"),

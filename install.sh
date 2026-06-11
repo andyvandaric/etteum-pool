@@ -43,6 +43,9 @@ fi
 
 have() { command -v "$1" >/dev/null 2>&1; }
 
+# Initialise PYTHON_BIN so it's always defined
+PYTHON_BIN=""
+
 show_summary() {
   printf "\n${C_BOLD}${C_BLUE}Etteum Pool${C_RESET} — AI Proxy Pool for Multiple Providers\n\n"
 
@@ -110,10 +113,18 @@ ensure_git() {
     else err "Install git manually for your distro"; exit 1
     fi
   fi
+  if ! have git; then
+    err "git installation finished but 'git' is not on PATH."
+    exit 1
+  fi
+  ok "Git installed"
 }
 
 ensure_bun() {
-  if have bun; then return; fi
+  if have bun; then
+    ok "Bun $(bun --version) already installed"
+    return
+  fi
   step "Installing Bun"
   curl -fsSL https://bun.sh/install | bash >/dev/null
   export BUN_INSTALL="$HOME/.bun"
@@ -130,9 +141,12 @@ ensure_python() {
     if have "$cand"; then
       PYTHON_BIN="$cand"
       local ver
-      ver=$("$cand" -c 'import sys;print("%d.%d"%sys.version_info[:2])')
+      ver=$("$cand" -c 'import sys;print("%d.%d"%sys.version_info[:2])' 2>/dev/null || echo "0.0")
       local major minor; IFS=. read -r major minor <<<"$ver"
-      if [[ "$major" -ge 3 && "$minor" -ge 10 ]]; then return; fi
+      if [[ "$major" -ge 3 && "$minor" -ge 10 ]]; then
+        ok "Python $ver found ($cand)"
+        return
+      fi
     fi
   done
   step "Installing Python 3.11+"
@@ -147,7 +161,26 @@ ensure_python() {
     else err "Install Python 3.10+ manually for your distro"; exit 1
     fi
   fi
+  if [[ -z "$PYTHON_BIN" ]] || ! have "$PYTHON_BIN"; then
+    err "Python installation failed — '$PYTHON_BIN' not found on PATH."
+    exit 1
+  fi
   ok "Python $($PYTHON_BIN --version 2>&1) installed"
+}
+
+# On Debian/Ubuntu, python3-venv is a separate package.
+# If `python3 -m venv` fails, try to install it.
+ensure_venv_module() {
+  if "$PYTHON_BIN" -m venv --help >/dev/null 2>&1; then return; fi
+  step "Installing python3-venv package"
+  if have apt-get; then
+    sudo apt-get update && sudo apt-get install -y python3-venv
+  fi
+  if ! "$PYTHON_BIN" -m venv --help >/dev/null 2>&1; then
+    err "Python venv module is not available. Install 'python3-venv' for your distro and re-run."
+    exit 1
+  fi
+  ok "python3-venv installed"
 }
 
 clone_or_update_repo() {
@@ -176,56 +209,170 @@ clone_or_update_repo() {
 write_env_if_missing() {
   step "Configuring .env"
   if [[ -f .env ]]; then
-    info ".env already exists, leaving untouched"
-    return
-  fi
-  cp .env.example .env
-
-  local key
-  if have openssl; then
-    key=$(openssl rand -hex 16)
-  elif [[ -r /dev/urandom ]]; then
-    key=$(head -c 16 /dev/urandom | xxd -p 2>/dev/null || head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n')
+    info ".env already exists, checking for missing keys..."
   else
-    key="$(date +%s)$(echo $RANDOM$RANDOM)"; key=${key:0:32}
+    cp .env.example .env
+    info "Created .env from .env.example"
   fi
-  if [[ -n "$key" ]]; then
-    if [[ "$OS" == "macos" ]]; then
-      sed -i '' "s|^ENCRYPTION_KEY=.*|ENCRYPTION_KEY=$key|" .env
+
+  # Generate ENCRYPTION_KEY if it's still the default placeholder
+  local current_key
+  current_key=$(grep '^ENCRYPTION_KEY=' .env 2>/dev/null | cut -d= -f2- || echo "")
+  if [[ -z "$current_key" || "$current_key" == "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6" ]]; then
+    local key=""
+    if have openssl; then
+      key=$(openssl rand -hex 16)
+    elif [[ -r /dev/urandom ]]; then
+      key=$(head -c 16 /dev/urandom | xxd -p 2>/dev/null || head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n')
     else
-      sed -i "s|^ENCRYPTION_KEY=.*|ENCRYPTION_KEY=$key|" .env
+      key="$(date +%s)$(echo $RANDOM$RANDOM)"; key=${key:0:32}
     fi
-    ok "Generated random ENCRYPTION_KEY"
+    if [[ -n "$key" ]]; then
+      if grep -q '^ENCRYPTION_KEY=' .env; then
+        if [[ "$OS" == "macos" ]]; then
+          sed -i '' "s|^ENCRYPTION_KEY=.*|ENCRYPTION_KEY=$key|" .env
+        else
+          sed -i "s|^ENCRYPTION_KEY=.*|ENCRYPTION_KEY=$key|" .env
+        fi
+      else
+        echo "ENCRYPTION_KEY=$key" >> .env
+      fi
+      ok "Generated random ENCRYPTION_KEY"
+    fi
   fi
+
+  # Ensure PYTHON_PATH is empty (auto-detect) or correct for this OS
+  if ! grep -q '^PYTHON_PATH=' .env; then
+    echo "PYTHON_PATH=" >> .env
+    info "Added PYTHON_PATH= (auto-detect)"
+  else
+    # If it has a Windows path on Linux or vice versa, clear it for auto-detect
+    local py_path
+    py_path=$(grep '^PYTHON_PATH=' .env | cut -d= -f2- || echo "")
+    if [[ -n "$py_path" ]]; then
+      # Check if the configured path actually exists
+      if [[ ! -x "$py_path" ]] && [[ ! -f "$py_path" ]]; then
+        warn "PYTHON_PATH=$py_path does not exist — clearing for auto-detect"
+        if [[ "$OS" == "macos" ]]; then
+          sed -i '' "s|^PYTHON_PATH=.*|PYTHON_PATH=|" .env
+        else
+          sed -i "s|^PYTHON_PATH=.*|PYTHON_PATH=|" .env
+        fi
+      fi
+    fi
+  fi
+
+  # Ensure other required keys exist
+  for key_name in PORT DASHBOARD_PORT API_KEY DATABASE_PATH AUTH_SCRIPT_PATH AUTH_SCRIPT_CWD; do
+    if ! grep -q "^${key_name}=" .env; then
+      local default_val
+      default_val=$(grep "^${key_name}=" .env.example 2>/dev/null | cut -d= -f2- || echo "")
+      echo "${key_name}=${default_val}" >> .env
+      info "Added missing ${key_name}"
+    fi
+  done
 }
 
 install_node_deps() {
-  step "Installing JS dependencies (bun install)"
-  bun install --silent
-  (cd dashboard && bun install --silent)
+  step "Installing JS dependencies"
+
+  # Verify bun is available
+  if ! have bun; then
+    export BUN_INSTALL="$HOME/.bun"
+    export PATH="$BUN_INSTALL/bin:$PATH"
+    if ! have bun; then
+      err "bun is not on PATH. Please open a new terminal and re-run the installer."
+      exit 1
+    fi
+  fi
+
+  info "Installing root dependencies..."
+  if ! bun install; then
+    err "bun install failed in project root"
+    info "Try running manually: cd $PROJECT_DIR && bun install"
+    exit 1
+  fi
+
+  info "Installing dashboard dependencies..."
+  if ! (cd dashboard && bun install); then
+    err "bun install failed in dashboard/"
+    info "Try running manually: cd $PROJECT_DIR/dashboard && bun install"
+    exit 1
+  fi
+
   ok "JS dependencies installed"
 }
 
 setup_python_venv() {
-  step "Setting up Python venv at scripts/auth/.venv"
-  if [[ ! -d scripts/auth/.venv ]]; then
-    "$PYTHON_BIN" -m venv scripts/auth/.venv
+  local venv_dir="scripts/auth/.venv"
+  local pip="$venv_dir/bin/pip"
+  local venv_python="$venv_dir/bin/python"
+
+  step "Setting up Python venv at $venv_dir"
+
+  # Ensure venv module is available (Debian/Ubuntu need python3-venv)
+  ensure_venv_module
+
+  if [[ ! -d "$venv_dir" ]]; then
+    info "Creating virtual environment..."
+    if ! "$PYTHON_BIN" -m venv "$venv_dir"; then
+      err "Failed to create Python venv at $venv_dir"
+      info "Try manually: $PYTHON_BIN -m venv $venv_dir"
+      info "On Ubuntu/Debian, you may need: sudo apt install python3-venv"
+      exit 1
+    fi
   fi
 
-  local pip="scripts/auth/.venv/bin/pip"
-  "$pip" install --upgrade pip wheel >/dev/null
-  "$pip" install -r scripts/auth/requirements.txt
+  # Validate venv was created correctly
+  if [[ ! -f "$venv_python" ]]; then
+    err "Python venv created but $venv_python not found!"
+    info "Expected: $venv_dir/bin/python"
+    info "Try deleting $venv_dir and re-running the installer."
+    exit 1
+  fi
+
+  if [[ ! -f "$pip" ]]; then
+    err "Python venv created but pip not found at $pip"
+    info "Try deleting $venv_dir and re-running the installer."
+    exit 1
+  fi
+
+  info "Upgrading pip..."
+  "$pip" install --upgrade pip wheel 2>&1 | tail -1
+
+  info "Installing Python packages (this may take a minute)..."
+  if ! "$pip" install -r scripts/auth/requirements.txt 2>&1 | tail -5; then
+    err "pip install failed"
+    info "Try manually: $pip install -r scripts/auth/requirements.txt"
+    exit 1
+  fi
   ok "Python deps installed"
 
-  step "Installing Playwright + Camoufox browsers (this can take a few minutes)"
-  scripts/auth/.venv/bin/python -m playwright install chromium >/dev/null 2>&1 || warn "Playwright Chromium install failed (you can re-run later)"
-  scripts/auth/.venv/bin/python -m camoufox fetch >/dev/null 2>&1 || warn "Camoufox fetch failed (you can re-run later)"
-  ok "Browsers ready"
+  step "Installing browsers (Playwright + Camoufox — this can take a few minutes)"
+  info "Installing Playwright Chromium..."
+  if "$venv_python" -m playwright install chromium 2>&1 | tail -3; then
+    ok "Playwright Chromium installed"
+  else
+    warn "Playwright Chromium install failed (you can re-run later)"
+    info "  Manual: $venv_python -m playwright install chromium"
+  fi
+
+  info "Fetching Camoufox browser..."
+  if "$venv_python" -m camoufox fetch 2>&1 | tail -3; then
+    ok "Camoufox browser installed"
+  else
+    warn "Camoufox fetch failed (you can re-run later)"
+    info "  Manual: $venv_python -m camoufox fetch"
+  fi
 }
 
 build_dashboard() {
   step "Building dashboard (production)"
-  (cd dashboard && bun run build) || { err "Dashboard build failed"; exit 1; }
+  if ! (cd dashboard && bun run build); then
+    err "Dashboard build failed"
+    info "Try manually: cd $PROJECT_DIR/dashboard && bun run build"
+    exit 1
+  fi
   ok "Dashboard built"
 }
 

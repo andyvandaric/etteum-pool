@@ -25,12 +25,17 @@ dist
 coverage
 *.lcov
 
-# logs
+# logs & pid files
 logs
 _.log
-report.[0-9]_.[0-9]_.[0-9]_.[0-9]_.json
+*.log
 .poolprox.log
 .poolprox.pid
+.etteum.log
+.etteum.pid
+.aiproxy.log
+.aiproxy.pid
+report.[0-9]_.[0-9]_.[0-9]_.[0-9]_.json
 
 # dotenv environment variable files
 .env
@@ -55,6 +60,10 @@ report.[0-9]_.[0-9]_.[0-9]_.[0-9]_.json
 
 # Database
 data/
+*.sqlite
+*.sqlite-journal
+*.sqlite-wal
+*.sqlite-shm
 
 # Drizzle migrations
 drizzle/
@@ -64,7 +73,9 @@ drizzle/
 
 # Debug artifacts
 *.png
-EOF
+
+# Claude plans (local only)
+.claude/plans/
 
 
 # Playwright MCP runtime
