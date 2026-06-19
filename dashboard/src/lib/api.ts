@@ -1,11 +1,12 @@
 function resolveApiBase(): string {
   if (import.meta.env.VITE_API_BASE) return import.meta.env.VITE_API_BASE;
-  const port = window.location.port;
-  if (!port || port === "443" || port === "80") {
-    return window.location.origin;
+  // When dashboard is served from the same origin as the API (single-port mode),
+  // just use the current origin. Only resolve a separate backend port if
+  // VITE_BACKEND_PORT is explicitly set (dev mode with separate vite dev server).
+  if (import.meta.env.VITE_BACKEND_PORT) {
+    return `http://${window.location.hostname}:${import.meta.env.VITE_BACKEND_PORT}`;
   }
-  const backendPort = import.meta.env.VITE_BACKEND_PORT || (Number(port) - 1) || "1930";
-  return `http://${window.location.hostname}:${backendPort}`;
+  return window.location.origin;
 }
 
 export const API_BASE = resolveApiBase();
@@ -14,12 +15,10 @@ export function getWsBase(): string {
   const configured = import.meta.env.VITE_WS_BASE;
   if (configured) return configured;
   const protocol = window.location.protocol === "https:" ? "wss" : "ws";
-  const port = window.location.port;
-  if (!port || port === "443" || port === "80") {
-    return `${protocol}://${window.location.hostname}`;
+  if (import.meta.env.VITE_BACKEND_PORT) {
+    return `${protocol}://${window.location.hostname}:${import.meta.env.VITE_BACKEND_PORT}`;
   }
-  const backendPort = import.meta.env.VITE_BACKEND_PORT || (Number(port) - 1) || "1930";
-  return `${protocol}://${window.location.hostname}:${backendPort}`;
+  return `${protocol}://${window.location.host}`;
 }
 
 function getApiKey(): string {
