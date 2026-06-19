@@ -143,8 +143,10 @@ app.get("/api/info", (c) => {
 });
 
 // Serve dashboard static files (SPA fallback)
-const dashboardDist = new URL("../dashboard/dist", import.meta.url).pathname.replace(/^\/([A-Z]:)/i, "$1");
-const dashboardIndex = `${dashboardDist}/index.html`;
+import { join } from "path";
+
+const dashboardDist = join(import.meta.dir, "..", "dashboard", "dist");
+const dashboardIndex = join(dashboardDist, "index.html");
 
 const staticMimeTypes: Record<string, string> = {
   ".html": "text/html; charset=utf-8",

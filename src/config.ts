@@ -6,20 +6,32 @@ export const config = {
   port: Number(process.env.PORT) || 1930,
   dashboardPort: Number(process.env.DASHBOARD_PORT) || 1931,
   apiKey: process.env.API_KEY || "pool-proxy-secret-key",
-  databasePath: process.env.DATABASE_PATH || path.join(projectRoot, "data/poolprox3.db"),
-  authScriptPath:
-    process.env.AUTH_SCRIPT_PATH ||
-    path.join(projectRoot, "scripts/auth/login.py"),
-  pythonPath:
+
+  // Semua path dibungkus path.resolve agar selalu absolute dan aman di OS apapun
+  databasePath: path.resolve(
+    projectRoot,
+    process.env.DATABASE_PATH || "data/poolprox3.db",
+  ),
+
+  authScriptPath: path.resolve(
+    projectRoot,
+    process.env.AUTH_SCRIPT_PATH || "scripts/auth/login.py",
+  ),
+
+  pythonPath: path.resolve(
+    projectRoot,
     process.env.PYTHON_PATH ||
-    path.join(
-      projectRoot,
-      "scripts/auth/.venv",
-      process.platform === "win32" ? "Scripts/python.exe" : "bin/python",
-    ),
-  authScriptCwd:
-    process.env.AUTH_SCRIPT_CWD ||
-    path.join(projectRoot, "scripts/auth"),
+      path.join(
+        "scripts/auth/.venv",
+        process.platform === "win32" ? "Scripts/python.exe" : "bin/python",
+      ),
+  ),
+
+  authScriptCwd: path.resolve(
+    projectRoot,
+    process.env.AUTH_SCRIPT_CWD || "scripts/auth",
+  ),
+
   proxyUrl: process.env.PROXY_URL || "",
   encryptionKey:
     process.env.ENCRYPTION_KEY || "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6",
@@ -39,12 +51,23 @@ export const config = {
   // The principle: timeouts are SAFETY NETS for stuck infra, not caps on
   // Kiro Pro upgrade settings
   kiroProUpgrade: process.env.KIRO_PRO_UPGRADE === "true",
-  billingAddress: JSON.parse(process.env.BILLING_ADDRESS || '{"name":"John Doe","country":"US","line1":"123 Main St","city":"New York","state":"NY","postal_code":"10001"}'),
+  billingAddress: JSON.parse(
+    process.env.BILLING_ADDRESS ||
+      '{"name":"John Doe","country":"US","line1":"123 Main St","city":"New York","state":"NY","postal_code":"10001"}',
+  ),
   browserEngine: process.env.BROWSER_ENGINE || "camoufox",
   captchaService: process.env.CAPTCHA_SERVICE || "none",
   captchaApiKey: process.env.CAPTCHA_API_KEY || "",
+
   // Providers: kiro, kiro-pro, codebuddy, canva, codex, qoder
-  providers: ["kiro", "kiro-pro", "codebuddy", "canva", "codex", "qoder"] as const,
+  providers: [
+    "kiro",
+    "kiro-pro",
+    "codebuddy",
+    "canva",
+    "codex",
+    "qoder",
+  ] as const,
 } as const;
 
 export type Config = typeof config;

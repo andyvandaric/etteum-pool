@@ -1,4 +1,6 @@
 #!/usr/bin/env bun
+import { join } from "path";
+
 /**
  * Production start script.
  *
@@ -9,14 +11,15 @@
  * Both are lightweight Bun processes. No Vite dev server.
  *
  * Usage:
- *   bun run production
- *   bun run scripts/production.ts
- *   bun run scripts/production.ts --skip-build
+ * bun run production
+ * bun run scripts/production.ts
+ * bun run scripts/production.ts --skip-build
  */
 
-const root = new URL("..", import.meta.url).pathname;
-const dashboardDir = `${root}/dashboard`;
-const dashboardDist = `${dashboardDir}/dist/index.html`;
+// Gunakan import.meta.dir dan modul path agar format direktori aman di Windows
+const root = join(import.meta.dir, "..");
+const dashboardDir = join(root, "dashboard");
+const dashboardDist = join(dashboardDir, "dist", "index.html");
 const skipBuild = process.argv.includes("--skip-build");
 
 const port = process.env.PORT || "1930";
@@ -32,7 +35,8 @@ async function buildDashboard() {
 
   if (!skipBuild || !distExists) {
     console.log("[production] Building dashboard...");
-    const proc = Bun.spawn(["bun", "run", "build"], {
+    // Gunakan process.execPath pengganti "bun" agar aman di Windows
+    const proc = Bun.spawn([process.execPath, "run", "build"], {
       cwd: dashboardDir,
       stdout: "inherit",
       stderr: "inherit",
@@ -59,25 +63,14 @@ console.log(`║  Backend:   http://localhost:${port}    ║`);
 console.log(`║  Dashboard: http://localhost:${dashboardPort}    ║`);
 console.log(`╚══════════════════════════════════════╝\n`);
 
-// Start backend
-const backend = Bun.spawn(["bun", "src/index.ts"], {
+// Start backend (serves dashboard static files too)
+const backend = Bun.spawn([process.execPath, "src/index.ts"], {
   cwd: root,
   stdout: "inherit",
   stderr: "inherit",
   env: {
     ...process.env,
     PORT: port,
-    NODE_ENV: "production",
-  },
-});
-
-// Start dashboard static server
-const dashboard = Bun.spawn(["bun", "run", "scripts/serve-dashboard.ts"], {
-  cwd: root,
-  stdout: "inherit",
-  stderr: "inherit",
-  env: {
-    ...process.env,
     DASHBOARD_PORT: dashboardPort,
     NODE_ENV: "production",
   },
@@ -89,24 +82,15 @@ function shutdown(code = 0) {
   if (shuttingDown) return;
   shuttingDown = true;
   backend.kill();
-  dashboard.kill();
   setTimeout(() => process.exit(code), 300).unref();
 }
 
 process.on("SIGINT", () => shutdown(0));
 process.on("SIGTERM", () => shutdown(0));
 
-// If either process dies, shut down both
 backend.exited.then((code) => {
   if (!shuttingDown) {
     console.error(`[production] Backend exited with code ${code}`);
-    shutdown(code || 1);
-  }
-});
-
-dashboard.exited.then((code) => {
-  if (!shuttingDown) {
-    console.error(`[production] Dashboard exited with code ${code}`);
     shutdown(code || 1);
   }
 });
