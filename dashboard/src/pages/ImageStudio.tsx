@@ -76,6 +76,7 @@ const ASPECT_RATIOS: Array<{ value: string; label: string; icon: string }> = [
 function labelProvider(provider: string) {
   if (provider === "kiro-pro") return "Kiro Pro";
   if (provider === "codebuddy") return "CodeBuddy";
+  if (provider === "codebuddy-china") return "CodeBuddy CN";
   return provider.charAt(0).toUpperCase() + provider.slice(1);
 }
 

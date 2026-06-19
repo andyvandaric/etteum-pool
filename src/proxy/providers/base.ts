@@ -182,7 +182,14 @@ export abstract class BaseProvider {
       };
     }
 
-    if (quota.quota && quota.quota.remaining <= 0) {
+    // Sentinel `-1` means "unknown / unlimited" — not exhausted. Only flip
+    // status to exhausted when we have a real positive limit and it's drained.
+    if (
+      quota.quota &&
+      typeof quota.quota.limit === "number" &&
+      quota.quota.limit > 0 &&
+      quota.quota.remaining <= 0
+    ) {
       return {
         kind: "exhausted",
         success: true,

@@ -15,6 +15,12 @@ import { sql } from "drizzle-orm";
 const IDEMPOTENT_COLUMNS: Array<{ table: string; column: string; ddl: string }> = [
   // 2026-06-13 — compression_stats (token-saver telemetry, see src/proxy/compression/)
   { table: "request_logs", column: "compression_stats", ddl: "ALTER TABLE request_logs ADD COLUMN compression_stats TEXT" },
+  // 2026-06-14 — Qoder Free counter (mirrors /activity qmodel_latest promo).
+  // Decremented per-request when the model maps to qmodel_latest. Synced (and
+  // overridden) from Qoder by warmup. See src/auth/warmup-runner.ts.
+  { table: "accounts", column: "free_limit",     ddl: "ALTER TABLE accounts ADD COLUMN free_limit REAL DEFAULT 0" },
+  { table: "accounts", column: "free_remaining", ddl: "ALTER TABLE accounts ADD COLUMN free_remaining REAL DEFAULT 0" },
+  { table: "accounts", column: "free_reset_at",  ddl: "ALTER TABLE accounts ADD COLUMN free_reset_at INTEGER" },
 ];
 
 function tableHasColumn(table: string, column: string): boolean {

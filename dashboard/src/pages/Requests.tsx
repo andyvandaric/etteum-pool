@@ -59,7 +59,9 @@ function getStatusColor(status: string): "success" | "warning" | "error" {
 }
 
 function labelProvider(provider: string) {
-  return provider === "codebuddy" ? "CodeBuddy" : provider.charAt(0).toUpperCase() + provider.slice(1);
+  if (provider === "codebuddy") return "CodeBuddy";
+  if (provider === "codebuddy-china") return "CodeBuddy CN";
+  return provider.charAt(0).toUpperCase() + provider.slice(1);
 }
 
 export default function Requests() {

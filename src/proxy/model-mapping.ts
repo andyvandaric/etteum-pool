@@ -123,12 +123,33 @@ function matchesPattern(model: string, rule: ModelMapping): boolean {
 }
 
 /**
+ * Model ids that are native to a specific in-pool provider (not Claude Code's
+ * generic anthropic ids) should bypass mapping entirely — otherwise calling
+ * `claude_sonnet_4_6_vertex` directly gets rewritten by the "sonnet" template.
+ *
+ * Claude Code only ever sends DASHED ids ("claude-3-5-sonnet-..."), so using
+ * underscore presence as the discriminator is a safe and zero-config rule.
+ */
+function isNativeProviderId(model: string): boolean {
+  // Native ids using underscore convention: claude_sonnet_4_6, gpt_5_codex, gemini_3_5_flash, …
+  if (/^(claude|gpt|gemini)_/.test(model)) return true;
+  // Explicit alias prefixes used by routed providers:
+  if (model.startsWith("qd-")) return true;          // Qoder
+  if (model.startsWith("cb-")) return true;          // CodeBuddy
+  if (model.startsWith("kiro:")) return true;        // Kiro Pro variant
+  return false;
+}
+
+/**
  * Rewrite an incoming model id to its mapped target, if any. Single pass (no
  * recursive remapping). Returns the original model when mapping is disabled,
- * no rule matches, or the target is empty/identical.
+ * no rule matches, the target is empty/identical, or the id is a native
+ * in-pool provider id (which is never the target of a generic Claude Code
+ * mapping).
  */
 export function resolveModelAlias(model: string): string {
   if (!model || !masterEnabled) return model;
+  if (isNativeProviderId(model)) return model;
   for (const rule of cache) {
     if (!rule.enabled) continue;
     if (!rule.targetModel) continue;

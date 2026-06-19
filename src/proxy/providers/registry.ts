@@ -1,6 +1,7 @@
 import type { BaseProvider, ModelInfo } from "./base";
 import { KiroProvider } from "./kiro";
 import { CodeBuddyProvider } from "./codebuddy";
+import { CodeBuddyChinaProvider } from "./codebuddy-china";
 import { CanvaProvider } from "./canva";
 import { CodexProvider } from "./codex";
 import { QoderProvider } from "./qoder";
@@ -24,21 +25,23 @@ import { ByokProvider } from "./byok";
 const kiro = new KiroProvider({ variant: "standard" });
 const kiroPro = new KiroProvider({ variant: "pro" });
 const codebuddy = new CodeBuddyProvider();
+const codebuddyChina = new CodeBuddyChinaProvider();
 const canva = new CanvaProvider();
 const codex = new CodexProvider();
 const qoder = new QoderProvider();
 const byok = new ByokProvider();
 
-// Priority order. canva/qoder/codex/kiro-pro have unique prefixes; codex is
-// listed before codebuddy so the literal "gpt-5-codex" resolves to codex while
-// codebuddy keeps its own "gpt-5*"/"gpt-5.x-codex" models. byok checks dynamic
-// prefixes from DB accounts. kiro is the fallback.
-const PROVIDER_ORDER = [canva, qoder, codex, kiroPro, byok, codebuddy, kiro] as const;
+// Priority order. canva/qoder/codex/kiro-pro have unique prefixes; codex
+// is listed before codebuddy so the literal "gpt-5-codex" resolves to codex
+// while codebuddy keeps its own "gpt-5*"/"gpt-5.x-codex" models. byok checks
+// dynamic prefixes from DB accounts. kiro is the fallback.
+const PROVIDER_ORDER = [canva, qoder, codex, kiroPro, byok, codebuddyChina, codebuddy, kiro] as const;
 
 export const providers = {
   kiro,
   "kiro-pro": kiroPro,
   codebuddy,
+  "codebuddy-china": codebuddyChina,
   canva,
   codex,
   qoder,
@@ -73,4 +76,3 @@ export async function refreshByokModels(): Promise<void> {
 export function getByokProvider(): ByokProvider {
   return byok;
 }
-

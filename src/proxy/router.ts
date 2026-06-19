@@ -135,18 +135,22 @@ export async function routeRequest(
   // Try up to 3 accounts before giving up
   const maxRetries = 3;
   let lastError = "";
+  const attemptedByokAccountIds = new Set<number>();
 
   for (let attempt = 0; attempt < maxRetries; attempt++) {
     // BYOK uses prefix-based account lookup (not the generic pool),
     // so it can also find error-status accounts and retry them.
     const account = providerName === "byok"
-      ? (await pool.getAccountForModel(compressedRequest.model))?.account ?? null
+      ? (await pool.getAccountForModel(compressedRequest.model, {
+          excludeAccountIds: attemptedByokAccountIds,
+        }))?.account ?? null
       : await pool.getNextAccount(providerName);
     if (!account) {
       throw new Error(
         `No active accounts available for provider: ${providerName}`
       );
     }
+    if (providerName === "byok") attemptedByokAccountIds.add(account.id);
 
     const startTime = Date.now();
     let tracked = false;
@@ -185,7 +189,14 @@ export async function routeRequest(
         continue; // Try next account without poisoning this one
       }
 
-      // Handle quota exhaustion (402 without PAYG)
+      // Handle quota exhaustion (402 / 403 without PAYG).
+      //
+      // Trust upstream: if the provider reports quota exhausted, mark it
+      // and move on. For Qoder, the next warmup tick will re-fetch
+      // /activity and /quota/usage and flip the account back to active
+      // automatically if Qoder reports remaining > 0 again. We accept the
+      // occasional false-exhaust (lifted within one warmup cycle) in
+      // exchange for never serving a known-bad account on retry.
       if (result.quotaExhausted) {
         await pool.markExhausted(account.id);
         lastError = result.error || "Quota exhausted";

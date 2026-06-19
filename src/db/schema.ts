@@ -11,6 +11,12 @@ export const accounts = sqliteTable("accounts", {
   quotaLimit: real("quota_limit").default(0),
   quotaRemaining: real("quota_remaining").default(0),
   quotaResetAt: integer("quota_reset_at", { mode: "timestamp" }),
+  // Qoder Free counter — mirror of /activity bucket qmodel_latest (Qwen3.7-Max promo).
+  // Decremented per-request when the model maps to qmodel_latest (e.g. qd-Qwen3.7-Max).
+  // Re-synced from Qoder by warmup; Qoder is source of truth on every override.
+  freeLimit: real("free_limit").default(0),
+  freeRemaining: real("free_remaining").default(0),
+  freeResetAt: integer("free_reset_at", { mode: "timestamp" }),
   lastUsedAt: integer("last_used_at", { mode: "timestamp" }),
   lastLoginAt: integer("last_login_at", { mode: "timestamp" }),
   errorMessage: text("error_message"),

@@ -19,7 +19,7 @@ function home(...segments: string[]): string {
  * Values are the PRIMARY config files to read/write; some clients have
  * secondary files handled inside their respective generators.
  */
-const CLIENT_PRIMARY_PATHS: Record<ClientTarget, Record<NodeJS.Platform, string>> = {
+const CLIENT_PRIMARY_PATHS: Record<ClientTarget, Partial<Record<NodeJS.Platform, string>>> = {
   opencode: {
     win32: home(".config", "opencode", "opencode.json"),
     darwin: home(".config", "opencode", "opencode.json"),
@@ -51,7 +51,7 @@ const CLIENT_PRIMARY_PATHS: Record<ClientTarget, Record<NodeJS.Platform, string>
  * Secondary paths per client (e.g., codex uses both auth.json + config.toml).
  * These are files that are also written during config application.
  */
-const CLIENT_SECONDARY_PATHS: Record<string, Record<NodeJS.Platform, string>> = {
+const CLIENT_SECONDARY_PATHS: Record<string, Partial<Record<NodeJS.Platform, string>>> = {
   "codex.auth": {
     win32: home(".codex", "auth.json"),
     darwin: home(".codex", "auth.json"),

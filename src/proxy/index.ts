@@ -1,7 +1,7 @@
 import { Hono } from "hono";
 import { routeRequest, getAllModels, providers } from "./router";
 import { db } from "../db/index";
-import { requestLogs, usageSummary, type NewRequestLog } from "../db/schema";
+import { requestLogs, usageSummary, accounts, type NewRequestLog } from "../db/schema";
 import { pool } from "./pool";
 import { broadcast } from "../ws/index";
 import type { ChatCompletionRequest, CreditSource } from "./providers/base";
@@ -251,6 +251,7 @@ function wrapStreamWithUsageFinalizer(
     fallbackTotalTokens: number;
     fallbackCreditsUsed: number;
     fallbackCreditSource: CreditSource;
+    useFreeCounter: boolean;
   }
 ): ReadableStream<Uint8Array> {
   const decoder = new TextDecoder();
@@ -330,9 +331,18 @@ function wrapStreamWithUsageFinalizer(
         const isQoder = context.provider === "qoder";
 
         // If stream had upstream error (403 rate limit, empty stream, etc), don't decrement quota
-        // and mark account exhausted for Qoder
+        // and mark account exhausted for Qoder — but verify with a probe first.
+        // Stream errors on Qoder are a noisy signal: rate-limit-per-second,
+        // signature replay protection, transient auth all surface as 403.
+        // The qd-Lite probe is the authoritative arbiter.
         if (streamError) {
           if (isQoder) {
+            // Trust upstream: if Qoder returned a stream error (typically a
+            // 403 due to genuine quota exhaustion or rate-limit), mark the
+            // account exhausted immediately. Warmup will flip it back to
+            // active once Qoder reports available quota again. No probe —
+            // we'd rather pay the occasional false-exhaust (lifted on the
+            // very next warmup tick) than serve a known-bad account.
             await pool.markExhausted(context.accountId);
           }
           // Still update request log with error status
@@ -349,14 +359,15 @@ function wrapStreamWithUsageFinalizer(
           return;
         }
 
-        const creditsToDecrement = isQoder ? 1 : creditsUsed;
-        const quotaAfter = context.quotaBefore > 0
-          ? await pool.decrementQuota(context.accountId, creditsToDecrement)
-          : 0;
-
-        // Qoder: mark exhausted when quota hits 0
-        if (isQoder && quotaAfter === 0 && context.quotaBefore > 0) {
-          await pool.markExhausted(context.accountId);
+        // Decrement at stream finalization. Qoder free-bucket (qmodel_latest)
+        // charges 1 request per call; other Qoder buckets stay unchanged
+        // (no local counter — server is sole truth). Non-Qoder providers
+        // keep existing token-based decrement.
+        let quotaAfter = context.quotaBefore;
+        if (isQoder && context.useFreeCounter && context.quotaBefore > 0) {
+          quotaAfter = await pool.decrementFreeQuota(context.accountId, 1);
+        } else if (!isQoder && context.quotaBefore > 0) {
+          quotaAfter = await pool.decrementQuota(context.accountId, creditsUsed);
         }
 
         if (context.logId) {
@@ -472,22 +483,32 @@ async function handleChatCompletion(body: ChatCompletionRequest) {
     result.creditSource
   );
 
-    // Qoder: check daily quota reset and use 1 credit per request
+    // Qoder: server IS the source of truth, but we now also decrement the
+    // local `freeRemaining` counter optimistically for free-bucket models
+    // (qmodel_latest). This gives the dashboard real-time numbers instead of
+    // waiting for the next warmup mirror. The warmup runner still overrides
+    // both columns from /activity each cycle, so any local drift is
+    // self-correcting.
     const isQoder = provider === "qoder";
+    const qoderProvider = providers["qoder"] as { isFreeModel?: (m: string) => boolean } | undefined;
+    const useFreeCounter = isQoder && qoderProvider?.isFreeModel?.(body.model) === true;
+
     const quotaBefore = isQoder
-      ? await pool.checkAndResetDailyQuota(account.id, 200)
+      ? useFreeCounter
+        ? Number(account.freeRemaining ?? 0)
+        : Number(account.quotaRemaining || 0)
       : Number(account.quotaRemaining || 0);
 
-    const creditsToDecrement = isQoder ? 1 : creditsUsed;
-    const quotaAfter = isStream
-      ? quotaBefore
-      : quotaBefore > 0
-        ? await pool.decrementQuota(account.id, creditsToDecrement)
-        : 0;
-
-    // Qoder: mark exhausted when quota hits 0
-    if (isQoder && !isStream && quotaAfter === 0 && quotaBefore > 0) {
-      await pool.markExhausted(account.id);
+    // For non-stream paths, decrement immediately. Stream paths and the
+    // Qoder paid bucket (where we don't track usage locally) stay unchanged.
+    let quotaAfter = quotaBefore;
+    if (!isStream) {
+      if (isQoder && useFreeCounter && quotaBefore > 0) {
+        // Qoder /activity bucket charges 1 request per call regardless of token count.
+        quotaAfter = await pool.decrementFreeQuota(account.id, 1);
+      } else if (!isQoder && quotaBefore > 0) {
+        quotaAfter = await pool.decrementQuota(account.id, creditsUsed);
+      }
     }
 
   const logEntry = {
@@ -537,6 +558,7 @@ async function handleChatCompletion(body: ChatCompletionRequest) {
       fallbackTotalTokens: totalTokens,
       fallbackCreditsUsed: creditsUsed,
       fallbackCreditSource: creditSource,
+      useFreeCounter,
     });
 
       shouldReleaseTracking = false;

@@ -9,6 +9,7 @@ import { formatDateTimeID } from "@/lib/utils";
 import { useTimedMessage } from "@/hooks/useTimedMessage";
 import { useWsEvent } from "@/hooks/useWebSocket";
 import {
+  bulkDeleteAccounts,
   deleteAccount,
   fetchAccounts,
   loginAccount,
@@ -20,7 +21,7 @@ import {
   warmupAllAccounts,
 } from "@/lib/api";
 
-type Provider = "kiro" | "kiro-pro" | "codebuddy" | "canva" | "codex" | "qoder";
+type Provider = "kiro" | "kiro-pro" | "codebuddy" | "codebuddy-china" | "canva" | "codex" | "qoder";
 type Status = "active" | "exhausted" | "error" | "pending" | "disabled";
 
 interface CodexQuotaWindow {
@@ -45,6 +46,9 @@ interface Account {
   enabled?: boolean;
   quotaLimit?: number;
   quotaRemaining?: number;
+  freeLimit?: number;
+  freeRemaining?: number;
+  freeResetAt?: string | null;
   lastUsedAt?: string | null;
   lastLoginAt?: string | null;
   errorMessage?: string | null;
@@ -52,7 +56,45 @@ interface Account {
     codex_quota?: CodexQuotaMetadata;
     overage?: { enabled: boolean; capable: boolean; used: number; cap: number; remaining: number } | null;
     inferenceProbe?: string;
+    activityQuota?: QoderActivityQuota | null;
+    activityQuotaError?: string | null;
+    serverQuota?: QoderServerQuota | null;
   } | null;
+}
+
+// Qoder /quota/usage snapshot persisted by warmup. Account-wide credit pool.
+interface QoderServerQuota {
+  limit?: number;
+  remaining?: number;
+  used?: number;
+  resetAt?: string | null;
+  source?: string | null;
+  reportedExhausted?: boolean;
+  reportedAt?: string;
+}
+
+// Qoder /activity endpoint shape — per-model promo buckets.
+// Mirrors `QoderActivity` in src/proxy/providers/qoder.ts.
+interface QoderActivityBucket {
+  type?: string;
+  activityId?: string;
+  modelName?: string;
+  modelKeys?: string[];           // upstream keys (e.g. ["qmodel_latest"])
+  limit?: number;
+  used?: number;
+  remaining?: number;
+  resetAt?: number;               // unix ms
+  resetStrategy?: string;
+  eligible?: boolean;
+  description?: string;
+  statusText?: string;
+}
+
+interface QoderActivityQuota {
+  activities?: QoderActivityBucket[];
+  queryAt?: number;
+  fetchedAt?: string;
+  [key: string]: unknown;
 }
 
 const statusVariants: Record<string, "success" | "warning" | "error" | "secondary"> = {
@@ -64,7 +106,9 @@ const statusVariants: Record<string, "success" | "warning" | "error" | "secondar
 };
 
 function labelProvider(provider: string) {
-  return provider === "codebuddy" ? "CodeBuddy" : provider.charAt(0).toUpperCase() + provider.slice(1);
+  if (provider === "codebuddy") return "CodeBuddy";
+  if (provider === "codebuddy-china") return "CodeBuddy CN";
+  return provider.charAt(0).toUpperCase() + provider.slice(1);
 }
 
 function formatCredit(value?: number | null) {
@@ -124,6 +168,95 @@ function CodexQuotaCell({ codex, fallbackRemaining, fallbackLimit }: { codex?: C
   );
 }
 
+function findQoderActivityBucket(activity: QoderActivityQuota | null | undefined, modelKey: string): QoderActivityBucket | null {
+  if (!activity || !Array.isArray(activity.activities)) return null;
+  return activity.activities.find((b) => Array.isArray(b?.modelKeys) && b.modelKeys.includes(modelKey)) ?? null;
+}
+
+function secondsUntil(unixMs?: number): number | null {
+  if (!unixMs || !Number.isFinite(unixMs)) return null;
+  const diff = Math.floor((unixMs - Date.now()) / 1000);
+  return diff > 0 ? diff : null;
+}
+
+function QoderQuotaCell({
+  account,
+}: {
+  account: Account;
+}) {
+  const activity = account.metadata?.activityQuota ?? null;
+  const activityErr = account.metadata?.activityQuotaError ?? null;
+  const bucket = findQoderActivityBucket(activity, "qmodel_latest");
+
+  // ---- Free bar (top): live DB columns are source of truth — they're
+  // overridden by warmup every cycle from /activity bucket qmodel_latest,
+  // and decremented per-request when a Free-promo model is used. ----
+  const freeLimit = Number(account.freeLimit ?? bucket?.limit ?? 0);
+  const freeRemaining = Number(account.freeRemaining ?? bucket?.remaining ?? 0);
+  const freeHasData = freeLimit > 0;
+  const freePct = freeHasData ? Math.max(0, Math.min(100, (freeRemaining / freeLimit) * 100)) : 0;
+  const freeTone = freePct <= 10 ? "bg-[var(--error)]" : freePct <= 40 ? "bg-[var(--warning)]" : "bg-[var(--success)]";
+  const freeResetSec = secondsUntil(bucket?.resetAt);
+  const freeReset = freeResetSec ? formatResetIn(freeResetSec) : null;
+
+  // ---- All bar (bottom): account-wide credit from /quota/usage (metadata.serverQuota) ----
+  // NOTE: account.quotaLimit/Remaining is owned by the custom-credit (200/day) system
+  // for Qoder, not by warmup. The authoritative server credit lives in metadata.serverQuota.
+  const server = account.metadata?.serverQuota ?? null;
+  const allLimit = Number(server?.limit ?? 0);
+  const allRemaining = Number(server?.remaining ?? 0);
+  const allHasData = server != null && allLimit > 0;
+  const allPct = allHasData ? Math.max(0, Math.min(100, (allRemaining / allLimit) * 100)) : 0;
+  const allTone = allPct <= 10 ? "bg-[var(--error)]" : allPct <= 40 ? "bg-[var(--warning)]" : "bg-[var(--success)]";
+  const allReportedExhausted = server?.reportedExhausted === true;
+
+  return (
+    <div className="space-y-1.5 min-w-[200px]">
+      {/* Free (promo) */}
+      <div className="space-y-0.5">
+        <div className="flex items-center justify-between text-[10px] text-[var(--muted-foreground)]">
+          <span className="font-medium">
+            Free
+            {bucket?.eligible === false && <span className="ml-1 text-[var(--warning)]">(ineligible)</span>}
+          </span>
+          <span>
+            {freeHasData
+              ? <>{freeRemaining}/{freeLimit}{freeReset ? ` · reset ${freeReset}` : ""}</>
+              : activityErr
+                ? <span className="text-[var(--error)]" title={activityErr}>err</span>
+                : <span className="opacity-60">n/a</span>}
+          </span>
+        </div>
+        <div className="h-1.5 w-full rounded-full bg-[var(--secondary)] overflow-hidden">
+          {freeHasData && <div className={`h-full ${freeTone}`} style={{ width: `${freePct}%` }} />}
+        </div>
+      </div>
+      {/* All (server credit from /quota/usage) */}
+      <div className="space-y-0.5">
+        <div className="flex items-center justify-between text-[10px] text-[var(--muted-foreground)]">
+          <span className="font-medium">
+            All
+            {allReportedExhausted && <span className="ml-1 text-[var(--warning)]" title="Server reported exhausted (probe may have overridden)">(rpt 0)</span>}
+          </span>
+          <span>
+            {allHasData
+              ? <>{formatCredit(allRemaining)}/{formatCredit(allLimit)}</>
+              : <span className="opacity-60">n/a</span>}
+            {account.metadata?.overage?.enabled && account.metadata.overage.remaining > 0 && (
+              <span className="ml-1 inline-block px-1 py-0 rounded text-[9px] bg-[var(--success)] text-white">
+                PAYG: {Math.round(account.metadata.overage.used)}
+              </span>
+            )}
+          </span>
+        </div>
+        <div className="h-1.5 w-full rounded-full bg-[var(--secondary)] overflow-hidden">
+          {allHasData && <div className={`h-full ${allTone}`} style={{ width: `${allPct}%` }} />}
+        </div>
+      </div>
+    </div>
+  );
+}
+
 type SortKey = "email" | "status" | "enabled" | "credit" | "lastLogin";
 type SortDir = "asc" | "desc";
 
@@ -140,6 +273,8 @@ export default function AccountList() {
   const [statusFilter, setStatusFilter] = useState<Status | "all">("all");
   const [sortKey, setSortKey] = useState<SortKey>("email");
   const [sortDir, setSortDir] = useState<SortDir>("asc");
+  const [selectedIds, setSelectedIds] = useState<Set<number>>(new Set());
+  const [bulkDeleting, setBulkDeleting] = useState(false);
 
   function handleSort(key: SortKey) {
     if (sortKey === key) {
@@ -204,7 +339,43 @@ export default function AccountList() {
 
   async function handleDelete(id: number) {
     if (!confirm(`Delete account #${id}?`)) return;
-    try { await deleteAccount(id); showSuccess(`Deleted #${id}`); await load(); } catch (err) { showError(err); }
+    try {
+      await deleteAccount(id);
+      showSuccess(`Deleted #${id}`);
+      setSelectedIds((prev) => {
+        if (!prev.has(id)) return prev;
+        const next = new Set(prev);
+        next.delete(id);
+        return next;
+      });
+      await load();
+    } catch (err) { showError(err); }
+  }
+
+  function toggleSelect(id: number) {
+    setSelectedIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  }
+
+  async function handleBulkDelete() {
+    const ids = Array.from(selectedIds);
+    if (ids.length === 0) return;
+    if (!confirm(`Delete ${ids.length} selected ${labelProvider(provider || "")} account(s)? This cannot be undone.`)) return;
+    setBulkDeleting(true);
+    try {
+      const res = await bulkDeleteAccounts(ids);
+      showSuccess(`Deleted ${res.deleted} account(s)${res.notFound.length ? ` · ${res.notFound.length} not found` : ""}`);
+      setSelectedIds(new Set());
+      await load();
+    } catch (err) {
+      showError(err);
+    } finally {
+      setBulkDeleting(false);
+    }
   }
 
   async function handleToggle(id: number, currentEnabled: boolean) {
@@ -268,6 +439,44 @@ export default function AccountList() {
   }, [accounts, search, statusFilter, sortKey, sortDir]);
 
   useEffect(() => { setPage(1); }, [search, provider, statusFilter]);
+
+  // Drop selections for rows that no longer exist (after reload/delete).
+  useEffect(() => {
+    setSelectedIds((prev) => {
+      if (prev.size === 0) return prev;
+      const live = new Set(accounts.map((a) => a.id));
+      let changed = false;
+      const next = new Set<number>();
+      for (const id of prev) {
+        if (live.has(id)) next.add(id);
+        else changed = true;
+      }
+      return changed ? next : prev;
+    });
+  }, [accounts]);
+
+  // Clear selection entirely when switching provider.
+  useEffect(() => { setSelectedIds(new Set()); }, [provider]);
+
+  const filteredIds = useMemo(() => filtered.map((a) => a.id), [filtered]);
+  const selectedVisibleCount = useMemo(
+    () => filteredIds.reduce((n, id) => (selectedIds.has(id) ? n + 1 : n), 0),
+    [filteredIds, selectedIds],
+  );
+  const allVisibleSelected = filteredIds.length > 0 && selectedVisibleCount === filteredIds.length;
+  const someVisibleSelected = selectedVisibleCount > 0 && !allVisibleSelected;
+
+  function toggleSelectAllVisible() {
+    setSelectedIds((prev) => {
+      const next = new Set(prev);
+      if (allVisibleSelected) {
+        for (const id of filteredIds) next.delete(id);
+      } else {
+        for (const id of filteredIds) next.add(id);
+      }
+      return next;
+    });
+  }
 
   const errorCount = accounts.filter((a) => a.status === "error").length;
   const enabledCount = accounts.filter((a) => a.enabled !== false).length;
@@ -335,6 +544,29 @@ export default function AccountList() {
         </div>
       </div>
 
+      {/* Bulk action bar */}
+      {selectedIds.size > 0 && (
+        <div className="flex flex-col gap-2 rounded-md border border-[var(--primary)]/40 bg-[var(--primary)]/[0.06] p-3 sm:flex-row sm:items-center sm:justify-between">
+          <span className="text-sm text-[var(--foreground)]">
+            {selectedIds.size} selected
+          </span>
+          <div className="flex gap-2">
+            <Button variant="outline" size="sm" onClick={() => setSelectedIds(new Set())} disabled={bulkDeleting}>
+              Clear
+            </Button>
+            <Button
+              variant="outline"
+              size="sm"
+              className="border-[var(--error)]/40 text-[var(--error)] hover:bg-[var(--error)]/10 hover:text-[var(--error)]"
+              onClick={handleBulkDelete}
+              disabled={bulkDeleting}
+            >
+              <Trash2 className="w-4 h-4 mr-2" /> {bulkDeleting ? "Deleting..." : `Delete (${selectedIds.size})`}
+            </Button>
+          </div>
+        </div>
+      )}
+
       {/* Table */}
       <Card className="border-[var(--border)]">
         <CardContent className="p-0">
@@ -342,6 +574,16 @@ export default function AccountList() {
             <table className="w-full">
               <thead>
                 <tr className="border-b border-[var(--border)]">
+                  <th className="w-10 p-4">
+                    <input
+                      type="checkbox"
+                      aria-label="Select all visible accounts"
+                      className="h-4 w-4 rounded border-[var(--border)] cursor-pointer accent-[var(--primary)]"
+                      checked={allVisibleSelected}
+                      ref={(el) => { if (el) el.indeterminate = someVisibleSelected; }}
+                      onChange={toggleSelectAllVisible}
+                    />
+                  </th>
                   <th className="text-left text-xs font-medium text-[var(--muted-foreground)] uppercase tracking-wide p-4 cursor-pointer select-none hover:text-[var(--foreground)]" onClick={() => handleSort("email")}>
                     <span className="inline-flex items-center">Email<SortIcon column="email" /></span>
                   </th>
@@ -364,7 +606,16 @@ export default function AccountList() {
                 {filtered.slice((page - 1) * perPage, page * perPage).map((account) => {
                   const isEnabled = account.enabled !== false;
                   return (
-                  <tr key={account.id} className={`border-b border-[var(--border)] last:border-0 hover:bg-[var(--secondary)]/50 ${isEnabled ? "" : "opacity-50"}`}>
+                  <tr key={account.id} className={`border-b border-[var(--border)] last:border-0 hover:bg-[var(--secondary)]/50 ${selectedIds.has(account.id) ? "bg-[var(--primary)]/[0.04]" : ""} ${isEnabled ? "" : "opacity-50"}`}>
+                    <td className="p-4">
+                      <input
+                        type="checkbox"
+                        aria-label={`Select ${account.email}`}
+                        className="h-4 w-4 rounded border-[var(--border)] cursor-pointer accent-[var(--primary)]"
+                        checked={selectedIds.has(account.id)}
+                        onChange={() => toggleSelect(account.id)}
+                      />
+                    </td>
                     <td className="p-4 text-sm text-[var(--foreground)]">
                       <div>{account.email}</div>
                       {account.errorMessage && <div className="text-xs text-[var(--error)] mt-1 line-clamp-1" title={account.errorMessage}>{account.errorMessage}</div>}
@@ -385,6 +636,8 @@ export default function AccountList() {
                     <td className="p-4 text-sm text-[var(--muted-foreground)] hidden sm:table-cell">
                       {account.provider === "codex"
                         ? <CodexQuotaCell codex={account.metadata?.codex_quota} fallbackRemaining={account.quotaRemaining} fallbackLimit={account.quotaLimit} />
+                        : account.provider === "qoder"
+                        ? <QoderQuotaCell account={account} />
                         : <span className="flex items-center gap-1.5">
                             {formatCredit(account.quotaRemaining)}/{formatCredit(account.quotaLimit)}
                             {account.metadata?.overage?.enabled && account.metadata.overage.remaining > 0 && (
@@ -417,7 +670,7 @@ export default function AccountList() {
                   );
                 })}
                 {!loading && filtered.length === 0 && (
-                  <tr><td colSpan={6} className="p-8 text-center text-sm text-[var(--muted-foreground)]">No accounts found</td></tr>
+                  <tr><td colSpan={7} className="p-8 text-center text-sm text-[var(--muted-foreground)]">No accounts found</td></tr>
                 )}
               </tbody>
             </table>

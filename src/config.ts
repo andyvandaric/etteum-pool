@@ -32,6 +32,11 @@ export const config = {
   authProcessTimeoutMs: Number(process.env.POOLPROX_AUTH_PROCESS_TIMEOUT_MS) || 10 * 60 * 1000,
   providerRequestTimeoutMs: Number(process.env.POOLPROX_PROVIDER_REQUEST_TIMEOUT_MS) || 120_000,
   providerQuotaTimeoutMs: Number(process.env.POOLPROX_PROVIDER_QUOTA_TIMEOUT_MS) || 15_000,
+  // ── Provider tunables ────────────────────────────────────────────────
+  // Defaults are tuned to handle the full task spectrum: short Q&A,
+  // multi-minute reasoning, AND multi-hour agentic loops (e.g. autonomous
+  // build → test → fix → repeat sessions that legitimately run for hours).
+  // The principle: timeouts are SAFETY NETS for stuck infra, not caps on
   // Kiro Pro upgrade settings
   kiroProUpgrade: process.env.KIRO_PRO_UPGRADE === "true",
   billingAddress: JSON.parse(process.env.BILLING_ADDRESS || '{"name":"John Doe","country":"US","line1":"123 Main St","city":"New York","state":"NY","postal_code":"10001"}'),

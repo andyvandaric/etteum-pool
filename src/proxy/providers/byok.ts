@@ -37,6 +37,12 @@ interface ByokTokens {
   models: string[];
   model_prefix: string;
   headers?: Record<string, string>;
+  /** Human-friendly key label inside a BYOK provider group (e.g. default, trial-1). */
+  key_label?: string;
+  /** Optional future-proofing for weighted balancing. Defaults to 1. */
+  weight?: number;
+  /** Lower number is preferred for sequential balancing. Defaults to account id order. */
+  priority?: number;
 }
 
 interface CachedByokAccount {
@@ -45,18 +51,26 @@ interface CachedByokAccount {
   expiresAt: number;
 }
 
+interface ByokSelectionOptions {
+  excludeAccountIds?: Set<number>;
+  loadBalancingMethod?: string;
+  getInFlightCount?: (accountId: number) => number;
+}
+
 export class ByokProvider extends BaseProvider {
   name = "byok";
   override supportedModels: ModelInfo[] = [];
   override isFallback = false;
   override nativeFormat: "openai" | "anthropic" = "openai";
 
-  // Synchronous prefix → account cache (required for ownsModel sync check)
-  private prefixCache = new Map<string, CachedByokAccount>();
+  // Synchronous prefix → accounts cache (required for ownsModel sync check).
+  // Multiple accounts can share a model_prefix; selection/load-balancing happens per prefix.
+  private prefixCache = new Map<string, CachedByokAccount[]>();
   private prefixes: string[] = [];
   private cacheExpiry = 0;
   private readonly CACHE_TTL = 10_000; // 10 seconds
   private refreshPromise: Promise<void> | null = null;
+  private lastIndexByPrefix = new Map<string, number>();
 
   // ── Cache Management ──────────────────────────────────────────────
 
@@ -82,9 +96,10 @@ export class ByokProvider extends BaseProvider {
       .where(eq(accounts.provider, "byok"));
 
     // Build new data in temporary variables first to avoid race condition
-    const newPrefixCache = new Map<string, CachedByokAccount>();
-    const newPrefixes: string[] = [];
+    const newPrefixCache = new Map<string, CachedByokAccount[]>();
+    const newPrefixSet = new Set<string>();
     const newSupportedModels: ModelInfo[] = [];
+    const modelIds = new Set<string>();
 
     for (const account of byokAccounts) {
       if (!account.enabled) continue;
@@ -98,13 +113,19 @@ export class ByokProvider extends BaseProvider {
 
       const prefix = tokens.model_prefix || account.email;
       const expiresAt = Date.now() + this.CACHE_TTL;
+      const entry: CachedByokAccount = { account, config: tokens, expiresAt };
 
-      newPrefixCache.set(prefix, { account, config: tokens, expiresAt });
-      newPrefixes.push(prefix);
+      const existing = newPrefixCache.get(prefix) || [];
+      existing.push(entry);
+      newPrefixCache.set(prefix, existing);
+      newPrefixSet.add(prefix);
 
       for (const model of tokens.models) {
+        const modelId = `${prefix}-${model}`;
+        if (modelIds.has(modelId)) continue;
+        modelIds.add(modelId);
         newSupportedModels.push({
-          id: `${prefix}-${model}`,
+          id: modelId,
           object: "model",
           created: Math.floor(Date.now() / 1000),
           owned_by: `byok:${prefix}`,
@@ -114,9 +135,18 @@ export class ByokProvider extends BaseProvider {
       }
     }
 
+    for (const entries of newPrefixCache.values()) {
+      entries.sort((a, b) => {
+        const priorityA = Number(a.config.priority ?? Number.POSITIVE_INFINITY);
+        const priorityB = Number(b.config.priority ?? Number.POSITIVE_INFINITY);
+        if (priorityA !== priorityB) return priorityA - priorityB;
+        return a.account.id - b.account.id;
+      });
+    }
+
     // Atomically swap in the new data
     this.prefixCache = newPrefixCache;
-    this.prefixes = newPrefixes;
+    this.prefixes = Array.from(newPrefixSet).sort((a, b) => b.length - a.length);
     this.supportedModels = newSupportedModels;
     this.cacheExpiry = Date.now() + this.CACHE_TTL;
   }
@@ -187,6 +217,14 @@ export class ByokProvider extends BaseProvider {
     return null;
   }
 
+  /** Public async helper for account-pool setting lookup. */
+  findPrefixForModel(model: string): string | null {
+    if (Date.now() >= this.cacheExpiry) {
+      this.refreshCache().catch(() => {/* swallow — next call will retry */});
+    }
+    return this.findPrefix(model);
+  }
+
   // ── Routing (synchronous — required by registry) ──────────────────
 
   /**
@@ -204,14 +242,84 @@ export class ByokProvider extends BaseProvider {
   }
 
   /**
-   * Find the BYOK account that owns a given model (by prefix).
+   * Find the BYOK account that owns a given model (by prefix) and select one
+   * key from that prefix group using the configured load-balancing strategy.
    * Called by pool.getAccountForModel() for async account selection.
    */
-  async findAccountForModel(model: string): Promise<Account | null> {
+  async findAccountForModel(
+    model: string,
+    options: ByokSelectionOptions = {}
+  ): Promise<Account | null> {
     await this.ensureCache();
     const prefix = this.findPrefix(model);
     if (!prefix) return null;
-    return this.prefixCache.get(prefix)?.account ?? null;
+
+    const actualModel = this.extractModel(model, prefix);
+    const entries = this.prefixCache.get(prefix) || [];
+    const excluded = options.excludeAccountIds || new Set<number>();
+
+    // Prefer active keys. Error keys remain in the cache only to keep model
+    // ownership claimed; they are tried only if no active key is available.
+    const supportsModel = (entry: CachedByokAccount) => entry.config.models.includes(actualModel);
+    const notExcluded = (entry: CachedByokAccount) => !excluded.has(entry.account.id);
+    let candidates = entries.filter((entry) =>
+      entry.account.enabled && entry.account.status === "active" && supportsModel(entry) && notExcluded(entry)
+    );
+
+    if (candidates.length === 0) {
+      candidates = entries.filter((entry) =>
+        entry.account.enabled && entry.account.status === "error" && supportsModel(entry) && notExcluded(entry)
+      );
+    }
+
+    if (candidates.length === 0) return null;
+    return this.selectAccount(prefix, candidates, options).account;
+  }
+
+  private selectAccount(
+    prefix: string,
+    candidates: CachedByokAccount[],
+    options: ByokSelectionOptions
+  ): CachedByokAccount {
+    if (candidates.length === 1) return candidates[0]!;
+
+    const getLoad = options.getInFlightCount || (() => 0);
+    const method = options.loadBalancingMethod || "round_robin";
+
+    if (method === "sequential") {
+      for (const candidate of candidates) {
+        if (getLoad(candidate.account.id) === 0) return candidate;
+      }
+      return candidates[0]!;
+    }
+
+    if (method === "least_inflight") {
+      return candidates.reduce((best, candidate) =>
+        getLoad(candidate.account.id) < getLoad(best.account.id) ? candidate : best
+      );
+    }
+
+    // Round robin (default), with least-in-flight tie-break so bursty workloads
+    // don't pile up on a slow upstream key.
+    const startIdx = ((this.lastIndexByPrefix.get(prefix) ?? -1) + 1) % candidates.length;
+    let selected = candidates[startIdx]!;
+    let selectedIdx = startIdx;
+    let selectedLoad = getLoad(selected.account.id);
+
+    for (let i = 1; i < candidates.length; i++) {
+      const idx = (startIdx + i) % candidates.length;
+      const candidate = candidates[idx]!;
+      const load = getLoad(candidate.account.id);
+      if (load < selectedLoad) {
+        selected = candidate;
+        selectedIdx = idx;
+        selectedLoad = load;
+        if (load === 0) break;
+      }
+    }
+
+    this.lastIndexByPrefix.set(prefix, selectedIdx);
+    return selected;
   }
 
   /** Get all BYOK models for /v1/models endpoint. */

@@ -16,24 +16,39 @@ import * as path from "node:path";
 // Reverse-engineered from github.com/cubk1/qoder2api (Java) + qodercli bundle.
 // ============================================================================
 
-const COSY_VERSION = "0.1.43";
+// Updated to match qodercli 1.0.22 capture (api2.qoder.sh host, new headers,
+// new business object, top-level `system` field). The earlier api3 host was
+// the qoder2api reverse-engineered fallback that the server still served but
+// did NOT charge against the qmodel_latest free-quota bucket.
+const COSY_VERSION = "1.0.22";
 const APPCODE = "cosy";
 const SIG_SECRET = "d2FyLCB3YXIgbmV2ZXIgY2hhbmdlcw=="; // base64("war, war never changes")
 const JOB_TOKEN_URL = "https://center.qoder.sh/algo/api/v3/user/jobToken?Encode=1";
 const USER_STATUS_URL = "https://center.qoder.sh/algo/api/v3/user/status?Encode=1";
 const QOTA_USAGE_URL = "https://openapi.qoder.sh/api/v2/quota/usage";
+// COSY-signed GET. Returns per-model promo "free quota" buckets (e.g. qmodel_latest 200/day),
+// distinct from QOTA_USAGE_URL which reports the account-wide credit balance.
+const ACTIVITY_URL = "https://openapi.qoder.sh/algo/api/v2/activity";
+
+// Business descriptors sent in body.business and Cosy-Business-* headers.
+// CLI uses product=cli, type=agent. Required for the server to attribute
+// the request to the right billing/promo bucket.
+const BUSINESS_PRODUCT = "cli";
+const BUSINESS_TYPE = "agent";
+const BUSINESS_VERSION = "1.0.22"; // matches Cosy-Version
+const COSY_SCENE = "assistant";
 
 export function openApiHeaders(securityOauthToken: string): Record<string, string> {
   return {
     Accept: "application/json",
     Authorization: `Bearer ${securityOauthToken}`,
     "Cosy-ClientType": "5",
-    "Cosy-Version": "1.0.6",
-    "User-Agent": "qoder/1.0.6",
+    "Cosy-Version": COSY_VERSION,
+    "User-Agent": "qoder/" + COSY_VERSION,
   };
 }
 const CHAT_URL =
-  "https://api3.qoder.sh/algo/api/v2/service/pro/sse/agent_chat_generation?FetchKeys=llm_model_result&AgentId=agent_common&Encode=1";
+  "https://api2.qoder.sh/algo/api/v2/service/pro/sse/agent_chat_generation?FetchKeys=llm_model_result&AgentId=agent_common&Encode=1";
 
 // 1024-bit RSA pubkey extracted from qodercli bundle. Server uses this to decrypt
 // the per-session AES key. Rotation by Qoder will break all clients at once.
@@ -123,13 +138,15 @@ function buildSessionContext(identity: AuthIdentity): SessionContext {
 }
 
 function buildPayloadB64(info: string): string {
-  // Sorted keys (matches Java TreeMap)
+  // Insertion order matches qodercli 1.0.22 capture exactly:
+  // {"version","requestId","info","cosyVersion","ideVersion"}
+  // (NOT alphabetically sorted as the older qoder2api Java port did)
   const m = {
+    version: "v1",
+    requestId: crypto.randomUUID(),
+    info,
     cosyVersion: COSY_VERSION,
     ideVersion: "",
-    info,
-    requestId: crypto.randomUUID(),
-    version: "v1",
   };
   return Buffer.from(JSON.stringify(m), "utf8").toString("base64");
 }
@@ -159,12 +176,11 @@ interface QoderTokens {
 }
 
 function generateMachineIdentity() {
+  // Mirror qodercli 1.0.22 layout: machineToken == machineId (same UUID),
+  // machineType is the literal client type "5" (NOT a random hex blob).
   const machineId = crypto.randomUUID();
-  const machineToken = Buffer.from(
-    (crypto.randomUUID() + crypto.randomUUID()).slice(0, 50),
-    "ascii",
-  ).toString("base64url");
-  const machineType = crypto.randomUUID().replace(/-/g, "").slice(0, 18);
+  const machineToken = machineId;
+  const machineType = "5";
   return { machineId, machineToken, machineType };
 }
 
@@ -196,6 +212,44 @@ interface JobTokenResponse {
   email?: string;
   plan?: string;
   userType?: string;
+}
+
+/**
+ * One row from `/algo/api/v2/activity`. Each row is a server-managed promo
+ * quota bucket scoped to one or more upstream model keys (e.g. `qmodel_latest`
+ * → qd-Qwen3.7-Max). Reset cadence and timezone are dictated by the server
+ * (`resetStrategy: DAY_EXPIRE`, `serverTimezone: Asia/Shanghai`).
+ */
+export interface QoderActivity {
+  type: string;              // e.g. "MODEL_FREE_QUOTA"
+  activityId: string;
+  modelName: string;
+  modelKeys: string[];       // upstream keys this quota applies to
+  limit: number;
+  used: number;
+  remaining: number;
+  resetAt: number;           // unix ms
+  resetStrategy: string;     // e.g. "DAY_EXPIRE"
+  serverTimezone: string;    // e.g. "Asia/Shanghai"
+  description?: string;
+  statusText?: string;
+  tag?: string;
+  tagStyle?: string;
+  eligible: boolean;
+  activityEndAt: number;     // unix ms — promo expiry
+  detailUrl?: string;
+}
+
+export interface QoderActivitySnapshot {
+  activities: QoderActivity[];
+  queryAt: number;           // unix ms reported by server
+  fetchedAt: string;         // ISO timestamp recorded locally
+}
+
+interface ActivityResponse {
+  code?: number;
+  msg?: string;
+  data?: { activities?: QoderActivity[]; queryAt?: number };
 }
 
 async function exchangeJobToken(tokens: QoderTokens): Promise<JobTokenResponse> {
@@ -239,12 +293,16 @@ function buildIdentity(tokens: QoderTokens): AuthIdentity {
 
 interface BearerCallOptions {
   url: string;
-  body: unknown;
+  /** Pass `null`/`undefined` for GET-style calls with no body. */
+  body?: unknown;
+  /** Defaults to "POST". Use "GET" for query-only endpoints (e.g. /activity). */
+  method?: "GET" | "POST";
   extraHeaders?: Record<string, string>;
   stream?: boolean;
 }
 
 export async function bearerFetch(tokens: QoderTokens, opts: BearerCallOptions): Promise<Response> {
+  const method = opts.method || "POST";
   const session = buildSessionContext(buildIdentity(tokens));
   const bodyEncoded = opts.body == null ? "" : encodeQoderPayload(JSON.stringify(opts.body));
   const payloadB64 = buildPayloadB64(session.info);
@@ -252,32 +310,47 @@ export async function bearerFetch(tokens: QoderTokens, opts: BearerCallOptions):
   const pathSig = pathSigFromUrl(opts.url);
   const sig = signBearerRequest(payloadB64, session.cosyKey, date, bodyEncoded, pathSig);
 
+  // Header layout matches qodercli 1.0.22 capture. Notable differences vs the
+  // older qoder2api port:
+  //   - cosy-data-policy is lowercase "agree" (was "AGREE")
+  //   - cosy-machinetype is the literal string "5" (client type indicator),
+  //     NOT a random UUID-derived value
+  //   - cosy-machinetoken equals cosy-machineid (same UUID)
+  //   - cosy-business-product / cosy-business-type / cosy-scene are NEW —
+  //     the server uses these to attribute the request to a billing bucket
+  //   - the fake link-local cosy-clientip is gone; CLI doesn't send it.
+  //   - user-agent is Go-http-client/2.0 (Go binary, unchanged)
+  const machineId = tokens.machineId;
+  const machineToken = tokens.machineToken || machineId; // CLI: token == id
   const headers: Record<string, string> = {
-    "cosy-data-policy": "AGREE",
-    "content-type": "application/json",
-    "cosy-machinetype": tokens.machineType,
+    "cosy-data-policy": "agree",
+    "cosy-machinetype": "5",
     "cosy-clienttype": "5",
     "cosy-date": date,
     "cosy-user": tokens.userId || "",
     "cosy-key": session.cosyKey,
     "cache-control": "no-cache",
+    "cosy-business-product": BUSINESS_PRODUCT,
+    "cosy-business-type": BUSINESS_TYPE,
+    "cosy-scene": COSY_SCENE,
     accept: opts.stream ? "text/event-stream" : "application/json",
-    "cosy-clientip": "169.254.198.161",
     authorization: `Bearer COSY.${payloadB64}.${sig}`,
     "accept-encoding": "identity",
     "cosy-version": COSY_VERSION,
-    "cosy-machineid": tokens.machineId,
-    "cosy-machinetoken": tokens.machineToken,
+    "cosy-machineid": machineId,
+    "cosy-machinetoken": machineToken,
     "login-version": "v2",
     "user-agent": "Go-http-client/2.0",
     ...(opts.extraHeaders || {}),
   };
 
-  return fetch(opts.url, {
-    method: "POST",
-    headers,
-    body: bodyEncoded,
-  });
+  // content-type is meaningful only when there's a body to send.
+  const init: RequestInit = { method, headers };
+  if (method !== "GET") {
+    headers["content-type"] = "application/json";
+    init.body = bodyEncoded;
+  }
+  return fetch(opts.url, init);
 }
 
 // ============================================================================
@@ -300,7 +373,15 @@ const QODER_MODELS: QoderModelDef[] = [
   { id: "qd-Performance",       upstream: "performance",   display_name: "Performance",       max_input_tokens: 272000, is_vl: true,  is_reasoning: false, price_factor: 1.1 },
   { id: "qd-Efficient",         upstream: "efficient",     display_name: "Efficient",         max_input_tokens: 180000, is_vl: true,  is_reasoning: false, price_factor: 0.3 },
   { id: "qd-Lite",              upstream: "lite",          display_name: "Lite",              max_input_tokens: 180000, is_vl: false, is_reasoning: false, price_factor: 0 },
-  { id: "qd-Qwen3.7-Max",       upstream: "qmodel_latest", display_name: "Qwen3.7-Max",       max_input_tokens: 180000, is_vl: true,  is_reasoning: false, price_factor: 0.2 },
+  // Qwen3.7-Max accepts up to 1M-token context windows. Qodercli's default
+  // `max_input_tokens: 180000` is just the lowest tier the picker offers —
+  // the server itself accepts much larger windows (the CLI lets users opt
+  // in to 200k / 400k / 1M from settings.json `model.contextWindow`).
+  // Advertise the full 1M here so downstream clients (Cline, Roo, Claude
+  // Code) don't trim history before we even reach Qoder. The server will
+  // reject requests it actually can't serve, which is the right place to
+  // enforce the real ceiling.
+  { id: "qd-Qwen3.7-Max",       upstream: "qmodel_latest", display_name: "Qwen3.7-Max",       max_input_tokens: 1000000, is_vl: true,  is_reasoning: false, price_factor: 0.2 },
   { id: "qd-Qwen3.6-Plus",      upstream: "qmodel",        display_name: "Qwen3.6-Plus",      max_input_tokens: 180000, is_vl: true,  is_reasoning: false, price_factor: 0.2 },
   { id: "qd-DeepSeek-V4-Pro",   upstream: "dmodel",        display_name: "DeepSeek-V4-Pro",   max_input_tokens: 180000, is_vl: true,  is_reasoning: true,  price_factor: 0.5 },
   { id: "qd-DeepSeek-V4-Flash", upstream: "dfmodel",       display_name: "DeepSeek-V4-Flash", max_input_tokens: 180000, is_vl: true,  is_reasoning: true,  price_factor: 0.1 },
@@ -428,10 +509,16 @@ ${toolDescriptions}
 
 Available tools: ${toolNames}`,
     });
-  } else if (!hasIncomingTools && !incomingHasSystem && Array.isArray(templateMessages)) {
-    for (const m of templateMessages) {
-      if (m && m.role === "system") result.push(m);
-    }
+  } else if (!hasIncomingTools && !incomingHasSystem) {
+    // Do NOT pull system messages from the Qoder-CLI template — they put
+    // the model in "Qoder CLI agent" mode (TodoWrite-everything, Windows
+    // hardcoded paths, "verify your output" loops, etc.) which causes
+    // off-topic repetition for plain chat. Add a neutral, minimal system
+    // prompt instead so the model just acts as a helpful assistant.
+    result.push({
+      role: "system",
+      content: "You are a helpful AI assistant. Answer the user's questions clearly and concisely. Maintain context from earlier turns in the conversation.",
+    });
   }
 
   for (const m of request.messages) {
@@ -538,31 +625,68 @@ Available tools: ${toolNames}`,
 }
 
 /**
- * Derive a stable session_id from conversation messages.
- * Qoder server uses session_id as the key for server-side persisted conversation
- * state (context, tool call records, compaction boundaries). A random UUID per
- * request causes the server to treat every request as a brand-new conversation,
- * making the model "forget" prior context and repeat itself.
+ * Derive a stable session_id from a conversation's ANCHOR (the parts that
+ * don't change as the conversation grows).
  *
- * By hashing all message content into a deterministic UUID, the same
- * conversation always maps to the same session_id while different conversations
- * get different IDs.
+ * Qoder server uses session_id as the key for server-side persisted
+ * conversation state (context, tool call records, compaction boundaries).
+ * The session_id MUST stay constant across every turn of the same chat —
+ * otherwise the server treats each turn as a brand-new conversation, the
+ * model "forgets" prior context, and answers loop or repeat themselves.
+ *
+ * Bug we're fixing: the previous implementation hashed ALL messages, so
+ * every new turn (with one more message appended) produced a different
+ * session_id. Effectively: every turn = new session = no memory.
+ *
+ * Fix: hash only the conversation ANCHOR — everything that's stable across
+ * turns:
+ *   1. All system messages (system prompts don't change mid-conversation)
+ *   2. The FIRST user message (the conversation opener)
+ *
+ * The first user turn is the natural fingerprint of "which conversation
+ * is this." Two different chats almost never start with identical opener
+ * text, so collisions are rare; the same chat always rehashes to the same
+ * value because the anchor never changes.
  */
 function deriveSessionId(messages: ChatCompletionRequest["messages"]): string {
   const hash = crypto.createHash("sha256");
-  for (const msg of messages) {
-    hash.update(msg.role + ":");
-    if (typeof msg.content === "string") {
-      hash.update(msg.content);
-    } else if (Array.isArray(msg.content)) {
-      for (const block of msg.content as any[]) {
+  let firstUserSeen = false;
+
+  const updateWithContent = (content: unknown) => {
+    if (typeof content === "string") {
+      hash.update(content);
+    } else if (Array.isArray(content)) {
+      for (const block of content as any[]) {
         if (block?.type === "text" && typeof block.text === "string") {
           hash.update(block.text);
         }
       }
     }
-    hash.update("\n");
+  };
+
+  for (const msg of messages) {
+    if (msg.role === "system") {
+      hash.update("system:");
+      updateWithContent(msg.content);
+      hash.update("\n");
+    } else if (msg.role === "user" && !firstUserSeen) {
+      hash.update("user:");
+      updateWithContent(msg.content);
+      hash.update("\n");
+      firstUserSeen = true;
+      // Stop here — anything after the first user message is volatile
+      // (the assistant's reply, follow-up turns) and would destabilize
+      // the session_id as the conversation grows.
+      break;
+    }
   }
+
+  // Edge case: no user message yet (e.g. system-only probe). Fall back to
+  // hashing the role sequence so probes still get deterministic IDs.
+  if (!firstUserSeen) {
+    hash.update("__no_user__");
+  }
+
   const hex = hash.digest("hex").slice(0, 32);
   // Format as valid UUID v4
   return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-4${hex.slice(13, 16)}-a${hex.slice(17, 20)}-${hex.slice(20, 32)}`;
@@ -585,7 +709,11 @@ function buildChatBody(request: ChatCompletionRequest, tokens: QoderTokens): any
   body.request_set_id = crypto.randomUUID();
   body.session_id = sessionId;
   body.stream = true;
-  body.aliyun_user_type = tokens.userType || "personal_standard";
+  // Qodercli 1.0.22 sends "" here (NOT "personal_standard"). Mirror that
+  // exactly — server uses this together with userType in the JWT to decide
+  // billing routing, and a non-empty value here appears to send the request
+  // down a path that bypasses the qmodel_latest free-quota bucket.
+  body.aliyun_user_type = "";
 
   if (!body.model_config) body.model_config = {};
   body.model_config.key = cfg.upstream;
@@ -596,10 +724,19 @@ function buildChatBody(request: ChatCompletionRequest, tokens: QoderTokens): any
   body.model_config.format = body.model_config.format || "openai";
   body.model_config.source = body.model_config.source || "system";
 
-  if (!body.business) body.business = {};
-  body.business.id = crypto.randomUUID();
-  body.business.begin_at = Date.now();
-  body.business.name = prompt.slice(0, 30);
+  // Business object — qodercli 1.0.22 shape. Server reads product/type/stage
+  // to attribute the request to the right billing bucket. Without these, the
+  // request is served but does NOT charge against the qmodel_latest free
+  // quota.
+  body.business = {
+    product: BUSINESS_PRODUCT,
+    version: BUSINESS_VERSION,
+    type: BUSINESS_TYPE,
+    id: crypto.randomUUID(),
+    name: prompt.slice(0, 30),
+    begin_at: Date.now(),
+    stage: "start",
+  };
 
   if (!body.chat_context) body.chat_context = {};
   body.chat_context.text = { type: "text", text: prompt };
@@ -624,12 +761,28 @@ function buildChatBody(request: ChatCompletionRequest, tokens: QoderTokens): any
 
   body.messages = buildQoderMessages(request, body.messages, hasIncomingTools);
 
+  // Mirror messages[0] system prompt up to top-level body.system. Qodercli
+  // 1.0.22 sends BOTH locations identically — server reads top-level `system`
+  // for billing/routing decisions while messages[0] feeds the model.
+  const sysMsg = body.messages.find((m: any) => m?.role === "system");
+  if (sysMsg && typeof sysMsg.content === "string") {
+    body.system = sysMsg.content;
+  }
+
   if (request.max_tokens && body.parameters) {
     body.parameters.max_tokens = request.max_tokens;
   }
 
+  // ALWAYS override `body.tools` from the request — never inherit the
+  // template's Qoder-CLI tool list (Bash/BashOutput/Edit/etc). If the
+  // client didn't send tools, send none. Inheriting template tools makes
+  // the model hallucinate tool calls the client cannot execute, which
+  // surfaces as repeated/looping responses (model keeps "trying" a tool
+  // that never returns a result).
   if (hasIncomingTools) {
     body.tools = request.tools;
+  } else {
+    body.tools = [];
   }
 
   return body;
@@ -749,6 +902,14 @@ export class QoderProvider extends BaseProvider {
     try {
       const t = typeof account.tokens === "string" ? JSON.parse(account.tokens) : account.tokens;
       if (!t || typeof t !== "object" || !t.personalToken) return null;
+      // Backfill missing machine identity. Older imports (pre 1.0.22 fix)
+      // wrote tokens without machineId/Token/Type. The cosy-machine* headers
+      // depend on these — without them the request is served but appears to
+      // skip the qmodel_latest free-quota bucket. Generate stable values now
+      // so all subsequent requests carry valid headers.
+      if (!t.machineId) t.machineId = crypto.randomUUID();
+      if (!t.machineToken) t.machineToken = t.machineId; // CLI: token == id
+      if (!t.machineType) t.machineType = "5"; // CLI literal client type
       return t as QoderTokens;
     } catch {
       return null;
@@ -888,7 +1049,17 @@ export class QoderProvider extends BaseProvider {
     const body = buildChatBody(request, tokens);
     let resp: Response;
     try {
-      resp = await bearerFetch(tokens, { url: CHAT_URL, body, stream: true });
+      const cfg = MODEL_CONFIGS[request.model] || QODER_MODELS[0]!;
+      const modelSource = body?.model_config?.source || "system";
+      resp = await bearerFetch(tokens, {
+        url: CHAT_URL,
+        body,
+        stream: true,
+        extraHeaders: {
+          "x-model-key": cfg.upstream,
+          "x-model-source": modelSource,
+        },
+      });
     } catch (e) {
       return { success: false, error: e instanceof Error ? e.message : String(e) };
     }
@@ -1143,6 +1314,48 @@ export class QoderProvider extends BaseProvider {
     return !!t?.personalToken;
   }
 
+  /**
+   * Whether a given Qoder model id is covered by a Free-promo bucket on
+   * `/activity`. Currently only `qmodel_latest` (Qwen3.7-Max) has a promo;
+   * other models hit the account-wide credit pool from `/quota/usage`.
+   *
+   * Used by the proxy to route per-request decrement to the correct counter.
+   */
+  isFreeModel(modelId: string): boolean {
+    const def = MODEL_CONFIGS[modelId];
+    return def?.upstream === "qmodel_latest";
+  }
+
+  /**
+   * Verify whether a Qoder account is *actually* quota-exhausted by probing the
+   * cheapest model (`qd-Lite`, price_factor=0). Live request 403s are noisy:
+   * rate limits, signature replay, transient auth issues all surface as 403.
+   * Use this before flipping status to `exhausted` so we don't poison accounts
+   * that can still serve requests.
+   *
+   * Returns:
+   *   - true  → probe definitively says quota is exhausted (mark exhausted)
+   *   - false → probe succeeded or failed transiently (don't mark, retry later)
+   */
+  async probeQuotaExhausted(account: Account): Promise<boolean> {
+    try {
+      const probe = await this.chatCompletion(account, {
+        model: "qd-Lite",
+        messages: [{ role: "user", content: "OK" }],
+        max_tokens: 4,
+      });
+      // Probe succeeded → account is alive. Don't poison.
+      if (probe.success) return false;
+      // Probe explicitly says quota exhausted → trust it.
+      if (probe.quotaExhausted) return true;
+      // Anything else (transient, network, auth) — treat as inconclusive.
+      return false;
+    } catch {
+      // Throwing means we can't verify — be conservative, don't mark.
+      return false;
+    }
+  }
+
   async fetchQuota(account: Account): Promise<{ success: boolean; quota?: { limit: number; remaining: number; used: number; resetAt?: Date | string | null }; error?: string }> {
     const parsed = this.parseTokens(account);
     if (!parsed?.personalToken) return { success: false, error: "No personalToken" };
@@ -1182,18 +1395,57 @@ export class QoderProvider extends BaseProvider {
     }
   }
 
+  /**
+   * Fetch per-model promo quotas (e.g. Qwen3.7-Max 200/day) from
+   * `/algo/api/v2/activity`. COSY-signed GET — same auth as chat calls.
+   *
+   * Best-effort: callers should treat failures as non-fatal and fall back to
+   * the account-wide `quota/usage` data.
+   */
+  private async fetchActivityQuota(tokens: QoderTokens): Promise<QoderActivitySnapshot> {
+    const resp = await bearerFetch(tokens, { url: ACTIVITY_URL, method: "GET" });
+    if (!resp.ok) {
+      const text = await resp.text().catch(() => "");
+      throw new Error(`activity HTTP ${resp.status}: ${text.slice(0, 120)}`);
+    }
+    const data = (await resp.json()) as ActivityResponse;
+    if (data.code !== 0) {
+      throw new Error(`activity code=${data.code} msg=${data.msg ?? "unknown"}`);
+    }
+    return {
+      activities: Array.isArray(data.data?.activities) ? data.data!.activities! : [],
+      queryAt: Number(data.data?.queryAt ?? Date.now()),
+      fetchedAt: new Date().toISOString(),
+    };
+  }
+
   override async healthCheck(account: Account): Promise<ProviderHealthResult> {
     const parsed = this.parseTokens(account);
     if (!parsed?.personalToken) {
       return { kind: "missing_tokens", success: false, error: "No personalToken" };
     }
 
+    let tokens: QoderTokens;
+    let refreshed = false;
     try {
-      const { tokens, refreshed } = await this.ensureFreshAuth(parsed);
-      if (!tokens.securityOauthToken) {
-        return { kind: "session_expired", success: false, error: "No securityOauthToken after refresh" };
-      }
+      const auth = await this.ensureFreshAuth(parsed);
+      tokens = auth.tokens;
+      refreshed = auth.refreshed;
+    } catch (error) {
+      return {
+        kind: "transient_error",
+        success: false,
+        retryable: true,
+        error: error instanceof Error ? error.message : String(error),
+      };
+    }
+    if (!tokens.securityOauthToken) {
+      return { kind: "session_expired", success: false, error: "No securityOauthToken after refresh" };
+    }
 
+    // ---- Account-wide credit (the "All" bar) ----
+    let result: ProviderHealthResult;
+    try {
       const resp = await fetch(QOTA_USAGE_URL, {
         method: "GET",
         headers: openApiHeaders(tokens.securityOauthToken),
@@ -1224,7 +1476,7 @@ export class QoderProvider extends BaseProvider {
       const exceeded = data.isQuotaExceeded === true || (remaining < 0) || (remaining <= 0 && limit > 0);
       const quota = { limit, remaining, used, resetAt, source: "qoder.openapi" };
 
-      return {
+      result = {
         kind: exceeded ? "exhausted" : "healthy",
         success: true,
         quota,
@@ -1238,6 +1490,23 @@ export class QoderProvider extends BaseProvider {
         error: error instanceof Error ? error.message : String(error),
       };
     }
+
+    // ---- Per-model promo quota (the "Free" bar) — best-effort enrichment ----
+    // We deliberately swallow errors here: a flaky activity endpoint must not
+    // poison an otherwise-healthy account. Failures are recorded as a
+    // breadcrumb in metadata for observability.
+    try {
+      const activity = await this.fetchActivityQuota(tokens);
+      result.metadata = { ...(result.metadata || {}), activityQuota: activity };
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : String(error);
+      result.metadata = {
+        ...(result.metadata || {}),
+        activityQuotaError: msg.slice(0, 200),
+      };
+    }
+
+    return result;
   }
 }
 

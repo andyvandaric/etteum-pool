@@ -60,6 +60,7 @@ try {
   console.error("[BYOK] Cache warm-up skipped:", e instanceof Error ? e.message : e);
 }
 
+
 // Start auto-warmup scheduler (reads settings from DB)
 await autoWarmupScheduler.start();
 

@@ -213,11 +213,19 @@ async def run_provider(adapter, account: NormalizedAccount) -> dict:
         }
     )
 
-    max_retries = CODEBUDDY_MAX_RETRIES if provider_name == "codebuddy" else MAX_RETRIES
+    if provider_name == "codebuddy":
+        max_retries = CODEBUDDY_MAX_RETRIES
+    else:
+        max_retries = MAX_RETRIES
 
     for attempt in range(max_retries):
         try:
-            timeout = KIRO_PRO_TIMEOUT if provider_name == "kiro-pro" else CODEBUDDY_TIMEOUT if provider_name == "codebuddy" else PROVIDER_TIMEOUT
+            if provider_name == "kiro-pro":
+                timeout = KIRO_PRO_TIMEOUT
+            elif provider_name == "codebuddy":
+                timeout = CODEBUDDY_TIMEOUT
+            else:
+                timeout = PROVIDER_TIMEOUT
             return await asyncio.wait_for(
                 _run_provider_once(adapter, account), timeout=timeout
             )

@@ -79,7 +79,7 @@ proxySettingsRouter.put("/:key", async (c) => {
     await db.insert(settings).values({ key, value: body.value });
   }
 
-  if (key === "load_balancing_method" || /^provider_.+_lb_method$/.test(key)) {
+  if (key === "load_balancing_method" || /^provider_.+_lb_method$/.test(key) || /^byok_.+_lb_method$/.test(key)) {
     pool.invalidateLoadBalancingCache();
   }
 
@@ -140,7 +140,7 @@ proxySettingsRouter.put("/", async (c) => {
       await db.insert(settings).values({ key, value });
     }
 
-    if (key === "load_balancing_method" || /^provider_.+_lb_method$/.test(key)) {
+    if (key === "load_balancing_method" || /^provider_.+_lb_method$/.test(key) || /^byok_.+_lb_method$/.test(key)) {
       lbCacheTouched = true;
     }
     if (isProxyPoolSettingKey(key)) {
