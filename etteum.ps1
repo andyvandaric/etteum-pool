@@ -9,9 +9,15 @@ param(
 
 $ErrorActionPreference = "Stop"
 
-# Auto-detect project dir: env override > script dir
+# Auto-detect project dir: env override > script dir > CWD > userprofile default
 if ($env:POOLPROX_HOME -and (Test-Path $env:POOLPROX_HOME)) {
   $ProjectDir = $env:POOLPROX_HOME
+} elseif (Test-Path (Join-Path (Split-Path -Parent $MyInvocation.MyCommand.Path) ".env")) {
+  $ProjectDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+} elseif (Test-Path (Join-Path $PWD ".env")) {
+  $ProjectDir = $PWD.Path
+} elseif (Test-Path "$env:USERPROFILE\etteum-pool\.env") {
+  $ProjectDir = "$env:USERPROFILE\etteum-pool"
 } else {
   $ProjectDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 }
@@ -47,6 +53,18 @@ function Test-PortInUse([int]$port) {
   } catch { return $false }
 }
 
+function Get-BunExe {
+  $cmd = Get-Command bun -ErrorAction SilentlyContinue
+  if (-not $cmd) { throw "bun not found in PATH" }
+  $src = $cmd.Source
+  if ($src -like "*.exe") { return $src }
+  if ($src -like "*.ps1") {
+    $exe = Join-Path (Split-Path $src) "node_modules\bun\bin\bun.exe"
+    if (Test-Path $exe) { return $exe }
+  }
+  throw "Cannot resolve bun.exe from: $src"
+}
+
 function Invoke-Start {
   $apiPort = [int](Get-EnvValue "PORT" "1930")
   $dashPort = [int](Get-EnvValue "DASHBOARD_PORT" "1931")
@@ -60,10 +78,13 @@ function Invoke-Start {
     return
   }
 
+  $bunExe = Get-BunExe
+  $prodScript = Join-Path $ProjectDir "scripts/production.ts"
+
   Write-Host "Starting Etteum..."
-  $proc = Start-Process -FilePath "bun" -ArgumentList "scripts/production.ts","--skip-build" `
-    -WorkingDirectory $ProjectDir -RedirectStandardOutput $LogFile -RedirectStandardError $LogFile `
-    -WindowStyle Hidden -PassThru
+  $proc = Start-Process -FilePath $bunExe -ArgumentList $prodScript,"--skip-build" `
+    -WorkingDirectory $ProjectDir -RedirectStandardOutput $LogFile `
+    -NoNewWindow -PassThru
   $proc.Id | Out-File -FilePath $PidFile -Encoding ascii
   Start-Sleep -Seconds 1
 
