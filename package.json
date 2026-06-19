@@ -1,6 +1,7 @@
 {
-  "name": "poolprox3",
+  "name": "etteum-pool",
   "version": "1.0.0",
+  "description": "AI Proxy Pool for Multiple Providers (Kiro, CodeBuddy, Codex, Canva, Qoder)",
   "type": "module",
   "scripts": {
     "start": "bun scripts/production.ts",
@@ -8,8 +9,10 @@
     "dev": "bun scripts/start.ts",
     "build": "cd dashboard && bun run build",
     "migrate": "bun src/db/migrate.ts",
+    "doctor": "bun scripts/doctor.ts",
     "setup": "bash install.sh",
-    "setup:win": "powershell -ExecutionPolicy Bypass -File install.ps1"
+    "setup:win": "powershell -ExecutionPolicy Bypass -File install.ps1",
+    "preflight": "bun scripts/preflight.ts"
   },
   "dependencies": {
     "cbor-x": "^1.6.4",

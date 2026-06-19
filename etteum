@@ -1,10 +1,11 @@
 #!/bin/bash
-# etteum - PoolProx3 management CLI
-# Usage: etteum [start|stop|restart|status|logs|build|dev|migrate]
+# etteum — Etteum Pool management CLI (Linux/macOS)
 #
-# SAFETY: this CLI manages ONLY the poolprox3 instance it ships with.
+# Usage: etteum [start|stop|restart|status|logs|build|dev|migrate|doctor|update|port|help]
+#
+# SAFETY: this CLI manages ONLY the etteum-pool instance it ships with.
 # It tracks its own process group via a PID file and kills only that
-# group on stop — it never uses a global `pkill` on "bun src/index.ts",
+# group on stop — it never uses a global `pkill` on bun processes,
 # so a separate poolprox/poolprox2 instance on other ports is left alone.
 
 set -euo pipefail
@@ -48,19 +49,31 @@ running_pid() {
   return 1
 }
 
-port_in_use() { ss -tlnp 2>/dev/null | grep -q ":$1 "; }
+port_in_use() { ss -tlnp 2>/dev/null | grep -q ":$1 " || lsof -iTCP:"$1" -sTCP:LISTEN -P 2>/dev/null | grep -q LISTEN; }
 
 rotate_log() {
   if [ -f "$LOG_FILE" ]; then
     local size
-    size=$(stat -c%s "$LOG_FILE" 2>/dev/null || echo 0)
+    size=$(stat -c%s "$LOG_FILE" 2>/dev/null || stat -f%z "$LOG_FILE" 2>/dev/null || echo 0)
     if [ "$size" -gt 5242880 ]; then
       tail -n 1000 "$LOG_FILE" > "$LOG_FILE.tmp" && mv "$LOG_FILE.tmp" "$LOG_FILE"
     fi
   fi
 }
 
+ensure_bun() {
+  if ! command -v bun >/dev/null 2>&1; then
+    if [ -x "$HOME/.bun/bin/bun" ]; then
+      export PATH="$HOME/.bun/bin:$PATH"
+    else
+      echo "❌ bun is not on PATH. Re-run the installer or add ~/.bun/bin to PATH."
+      exit 1
+    fi
+  fi
+}
+
 do_start() {
+  ensure_bun
   if pid=$(running_pid); then
     echo "✅ etteum already running (PID $pid)"
     echo "   Backend:   http://localhost:$API_PORT"
@@ -70,7 +83,7 @@ do_start() {
 
   if port_in_use "$API_PORT"; then
     echo "❌ Port $API_PORT already in use by another process. Aborting."
-    echo "   (poolprox3 defaults to 1930/1931 — check 'ss -tlnp | grep $API_PORT')"
+    echo "   Check: ss -tlnp | grep $API_PORT"
     return 1
   fi
   if port_in_use "$DASH_PORT"; then
@@ -79,7 +92,7 @@ do_start() {
   fi
 
   rotate_log
-  echo "Starting etteum (poolprox3)..."
+  echo "Starting etteum..."
   cd "$PROJECT_DIR"
   # setsid → new session/process group so 'stop' can target ONLY our subtree.
   setsid bun scripts/production.ts --skip-build >> "$LOG_FILE" 2>&1 &
@@ -107,7 +120,6 @@ do_stop() {
     return 0
   fi
 
-  # Kill ONLY this PID's process group — never a global pattern match.
   local pgid
   pgid=$(ps -o pgid= -p "$pid" 2>/dev/null | tr -d ' ')
   echo "Stopping etteum (PID $pid, group $pgid)..."
@@ -136,42 +148,118 @@ do_status() {
   fi
 }
 
+do_doctor() {
+  ensure_bun
+  cd "$PROJECT_DIR"
+  exec bun scripts/doctor.ts "$@"
+}
+
+do_update() {
+  ensure_bun
+  cd "$PROJECT_DIR"
+  echo "🔄 Pulling latest..."
+  if [ -d ".git" ]; then
+    git pull --ff-only || { echo "❌ git pull failed"; exit 1; }
+  else
+    echo "⚠️  Not a git checkout — re-run install.sh to upgrade."
+    return 1
+  fi
+  echo "📦 Installing dependencies..."
+  bun install
+  (cd dashboard && bun install)
+  echo "🔨 Building dashboard..."
+  (cd dashboard && bun run build)
+  echo "🗄️  Running migrations..."
+  bun src/db/migrate.ts || true
+  echo "🔄 Restarting..."
+  do_stop || true; sleep 1; do_start
+  echo "✅ Update complete"
+}
+
+do_port() {
+  local new_api="${1:-}" new_dash="${2:-}"
+  if [ -z "$new_api" ] || [ -z "$new_dash" ]; then
+    echo "Current ports: API=$API_PORT  Dashboard=$DASH_PORT"
+    echo "Usage: etteum port <api_port> <dashboard_port>"
+    return
+  fi
+  if [[ "$(uname)" == "Darwin" ]]; then
+    sed -i '' "s|^PORT=.*|PORT=$new_api|" "$ENV_FILE"
+    sed -i '' "s|^DASHBOARD_PORT=.*|DASHBOARD_PORT=$new_dash|" "$ENV_FILE"
+  else
+    sed -i "s|^PORT=.*|PORT=$new_api|" "$ENV_FILE"
+    sed -i "s|^DASHBOARD_PORT=.*|DASHBOARD_PORT=$new_dash|" "$ENV_FILE"
+  fi
+  echo "✅ Ports changed: API=$new_api  Dashboard=$new_dash"
+  if running_pid >/dev/null; then
+    echo "🔄 Restarting with new ports..."
+    do_stop; sleep 1
+    API_PORT=$new_api DASH_PORT=$new_dash do_start
+  fi
+}
+
 usage() {
   cat <<EOF
-etteum — PoolProx3 management CLI
+${C_BOLD:-}etteum${C_RESET:-} — Etteum Pool management CLI
 
-Usage: etteum <command>
+${C_BOLD:-}Usage:${C_RESET:-} etteum <command> [args]
 
-  start      Start backend + dashboard in the background (ports $API_PORT/$DASH_PORT)
-  stop       Stop this instance only (process-group scoped, safe for other instances)
-  restart    Stop then start
-  status     Show PID, group, and whether ports are listening
-  logs [N]   Follow logs, or print last N lines
-  build      Rebuild dashboard then restart
-  dev        Run in foreground with Vite HMR (Ctrl-C to quit)
-  migrate    Run database migrations
+${C_BOLD:-}Server:${C_RESET:-}
+  start              Start backend + dashboard in the background (ports $API_PORT/$DASH_PORT)
+  stop               Stop this instance only (process-group scoped, safe for other instances)
+  restart            Stop then start
+  status             Show PID, group, and whether ports are listening
+  dev                Run in foreground with Vite HMR (Ctrl-C to quit)
+
+${C_BOLD:-}Logs & maintenance:${C_RESET:-}
+  logs [N]           Follow logs, or print last N lines
+  build              Rebuild dashboard then restart
+  migrate            Run database migrations
+  doctor [--json]    Diagnose installation health (run this first when something breaks)
+  preflight          Quick smoke test of installed components
+
+${C_BOLD:-}Configuration:${C_RESET:-}
+  port <api> <dash>  Change ports (rewrites .env, restarts if running)
+  update             git pull → bun install → build → migrate → restart
+
+${C_BOLD:-}Help:${C_RESET:-}
+  help, -h, --help   Show this message
+
+${C_BOLD:-}Common workflows:${C_RESET:-}
+  First time:        bash install.sh && etteum start
+  After git pull:    etteum update
+  Something broke:   etteum doctor && etteum logs 50
+  Change ports:      etteum port 8080 8081
+
+${C_BOLD:-}Files:${C_RESET:-}
+  $PROJECT_DIR/.env          configuration
+  $PROJECT_DIR/.etteum.log   server logs (rotates at 5 MB)
+  $PROJECT_DIR/data/         SQLite database
 EOF
 }
 
 case "${1:-}" in
-  start)   do_start ;;
-  stop)    do_stop ;;
-  restart) do_stop; sleep 1; do_start ;;
-  status)  do_status ;;
+  start)     do_start ;;
+  stop)      do_stop ;;
+  restart)   do_stop || true; sleep 1; do_start ;;
+  status)    do_status ;;
   logs)
-    if [ -n "${2:-}" ]; then tail -n "$2" "$LOG_FILE"; else tail -f "$LOG_FILE"; fi
+    if [ -n "${2:-}" ]; then tail -n "$2" "$LOG_FILE"
+    else tail -f "$LOG_FILE"
+    fi
     ;;
   build)
+    ensure_bun
     echo "🔨 Building dashboard..."
     (cd "$PROJECT_DIR/dashboard" && bun run build)
-    do_stop; sleep 1; do_start
+    do_stop || true; sleep 1; do_start
     ;;
-  dev)
-    cd "$PROJECT_DIR" && exec bun scripts/start.ts
-    ;;
-  migrate)
-    cd "$PROJECT_DIR" && exec bun run migrate
-    ;;
+  dev)       ensure_bun; cd "$PROJECT_DIR" && exec bun scripts/start.ts ;;
+  migrate)   ensure_bun; cd "$PROJECT_DIR" && exec bun run migrate ;;
+  doctor)    shift; do_doctor "$@" ;;
+  preflight) ensure_bun; cd "$PROJECT_DIR" && exec bun scripts/preflight.ts ;;
+  update)    do_update ;;
+  port)      do_port "${2:-}" "${3:-}" ;;
   ""|help|-h|--help) usage ;;
   *) echo "Unknown command: $1"; echo; usage; exit 1 ;;
 esac

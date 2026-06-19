@@ -48,8 +48,8 @@ function Test-PortInUse([int]$port) {
 }
 
 function Invoke-Start {
-  $apiPort = [int](Get-EnvValue "PORT" "1630")
-  $dashPort = [int](Get-EnvValue "DASHBOARD_PORT" "1631")
+  $apiPort = [int](Get-EnvValue "PORT" "1930")
+  $dashPort = [int](Get-EnvValue "DASHBOARD_PORT" "1931")
 
   if (Test-PortInUse $apiPort) {
     Write-Host "Port $apiPort already in use. Run: .\etteum.ps1 stop" -ForegroundColor Red
@@ -92,8 +92,8 @@ function Invoke-Status {
   if (Test-Running) {
     $procId = Get-Content $PidFile
     Write-Host "Etteum is running (PID $procId)" -ForegroundColor Green
-    Write-Host "  Backend:   http://localhost:$(Get-EnvValue 'PORT' '1630')"
-    Write-Host "  Dashboard: http://localhost:$(Get-EnvValue 'DASHBOARD_PORT' '1631')"
+    Write-Host "  Backend:   http://localhost:$(Get-EnvValue 'PORT' '1930')"
+    Write-Host "  Dashboard: http://localhost:$(Get-EnvValue 'DASHBOARD_PORT' '1931')"
   } else {
     Write-Host "Etteum is not running"
   }
@@ -140,7 +140,7 @@ function Invoke-Build {
 
 function Invoke-Port([string]$apiPort, [string]$dashPort) {
   if (-not $apiPort -or -not $dashPort) {
-    Write-Host "Current ports: API=$(Get-EnvValue 'PORT' '1630') Dashboard=$(Get-EnvValue 'DASHBOARD_PORT' '1631')"
+    Write-Host "Current ports: API=$(Get-EnvValue 'PORT' '1930') Dashboard=$(Get-EnvValue 'DASHBOARD_PORT' '1931')"
     Write-Host "Usage: .\etteum.ps1 port <api_port> <dashboard_port>"
     return
   }
@@ -157,26 +157,63 @@ function Invoke-Port([string]$apiPort, [string]$dashPort) {
   }
 }
 
+function Invoke-Doctor {
+  Push-Location $ProjectDir
+  try { bun scripts/doctor.ts $args } finally { Pop-Location }
+}
+
+function Invoke-Preflight {
+  Push-Location $ProjectDir
+  try { bun scripts/preflight.ts } finally { Pop-Location }
+}
+
+function Invoke-Migrate {
+  Push-Location $ProjectDir
+  try { bun src/db/migrate.ts } finally { Pop-Location }
+}
+
+function Invoke-Dev {
+  Push-Location $ProjectDir
+  try { bun scripts/start.ts } finally { Pop-Location }
+}
+
 switch ($Command.ToLower()) {
-  "start"   { Invoke-Start }
-  "stop"    { Invoke-Stop }
-  "restart" { Invoke-Stop; Start-Sleep -Seconds 1; Invoke-Start }
-  "status"  { Invoke-Status }
-  "logs"    { Invoke-Logs $Arg1 }
-  "update"  { Invoke-Update }
-  "build"   { Invoke-Build }
-  "port"    { Invoke-Port $Arg1 $Arg2 }
+  "start"     { Invoke-Start }
+  "stop"      { Invoke-Stop }
+  "restart"   { Invoke-Stop; Start-Sleep -Seconds 1; Invoke-Start }
+  "status"    { Invoke-Status }
+  "logs"      { Invoke-Logs $Arg1 }
+  "update"    { Invoke-Update }
+  "build"     { Invoke-Build }
+  "port"      { Invoke-Port $Arg1 $Arg2 }
+  "doctor"    { Invoke-Doctor }
+  "preflight" { Invoke-Preflight }
+  "migrate"   { Invoke-Migrate }
+  "dev"       { Invoke-Dev }
   default {
-    Write-Host "etteum - Etteum Management CLI (Windows)`n"
-    Write-Host "Usage: .\etteum.ps1 <command>`n"
-    Write-Host "Commands:"
-    Write-Host "  start       Start the server"
-    Write-Host "  stop        Stop the server"
-    Write-Host "  restart     Restart the server"
-    Write-Host "  status      Show server status"
-    Write-Host "  logs        Follow server logs (.\etteum.ps1 logs -f)"
-    Write-Host "  update      Pull git, install deps, build, restart"
-    Write-Host "  build       Rebuild dashboard and restart"
-    Write-Host "  port        Show/change ports (.\etteum.ps1 port 1630 1631)"
+    Write-Host "etteum - Etteum Pool Management CLI (Windows)`n"
+    Write-Host "Usage: .\etteum.ps1 <command> [args]`n"
+    Write-Host "Server:" -ForegroundColor White -BackgroundColor DarkBlue
+    Write-Host "  start             Start the server"
+    Write-Host "  stop              Stop the server"
+    Write-Host "  restart           Restart the server"
+    Write-Host "  status            Show server status"
+    Write-Host "  dev               Run in foreground with HMR"
+    Write-Host ""
+    Write-Host "Logs & maintenance:" -ForegroundColor White -BackgroundColor DarkBlue
+    Write-Host "  logs [-f|N]       Follow logs, or print last N lines"
+    Write-Host "  build             Rebuild dashboard and restart"
+    Write-Host "  migrate           Run database migrations"
+    Write-Host "  doctor            Diagnose installation health"
+    Write-Host "  preflight         Quick smoke test"
+    Write-Host ""
+    Write-Host "Configuration:" -ForegroundColor White -BackgroundColor DarkBlue
+    Write-Host "  port <api> <dash> Change ports"
+    Write-Host "  update            Pull, install, build, restart"
+    Write-Host ""
+    Write-Host "Common workflows:"
+    Write-Host "  First time:       irm bun.sh/install.ps1 | iex; .\install.ps1; etteum start"
+    Write-Host "  After update:     etteum update"
+    Write-Host "  Something broke:  etteum doctor; etteum logs 50"
   }
 }

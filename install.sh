@@ -1,16 +1,26 @@
 #!/usr/bin/env bash
-# Etteum Pool installer for Linux and macOS
+# Etteum Pool installer for Linux and macOS (also WSL).
 #
 # One-command install:
 #   curl -fsSL https://raw.githubusercontent.com/priyo000/etteum-pool/main/install.sh | bash
 #
-# Or, after cloning:
+# Or after cloning:
 #   bash install.sh
+#
+# Environment variables (all optional):
+#   ETTEUM_HOME       Install directory (default: ~/etteum-pool)
+#   ETTEUM_REPO       Repo URL (default: github.com/priyo000/etteum-pool)
+#   ETTEUM_YES=1      Skip confirmation prompts (for CI / unattended installs)
+#   ETTEUM_BRANCH     Branch to clone (default: main)
+#   ETTEUM_NO_CLI=1   Skip the ~/.local/bin/etteum symlink
+#   ETTEUM_SKIP_BROWSERS=1  Skip Playwright/Camoufox download (needed for auth bot)
 
 set -euo pipefail
 
 REPO_URL="${ETTEUM_REPO:-https://github.com/priyo000/etteum-pool.git}"
 INSTALL_DIR_DEFAULT="${ETTEUM_HOME:-$HOME/etteum-pool}"
+BRANCH="${ETTEUM_BRANCH:-main}"
+ASSUME_YES="${ETTEUM_YES:-0}"
 
 C_RESET='\033[0m'
 C_BOLD='\033[1m'
@@ -27,29 +37,53 @@ warn()  { printf "${C_YELLOW}!!${C_RESET}  %s\n" "$*"; }
 err()   { printf "${C_RED}xx${C_RESET}  %s\n" "$*" 1>&2; }
 ok()    { printf "${C_GREEN}ok${C_RESET}  %s\n" "$*"; }
 
+have() { command -v "$1" >/dev/null 2>&1; }
+
+# Detect OS + distro family
+OS=""
+DISTRO_FAMILY=""
 detect_os() {
   case "$(uname -s)" in
-    Linux*)  echo "linux" ;;
-    Darwin*) echo "macos" ;;
-    *)       echo "unsupported" ;;
+    Linux*)
+      OS="linux"
+      if [[ -r /etc/os-release ]]; then
+        # shellcheck source=/dev/null
+        . /etc/os-release
+        case "${ID_LIKE:-$ID}" in
+          *debian*|*ubuntu*) DISTRO_FAMILY="debian" ;;
+          *rhel*|*fedora*|*centos*) DISTRO_FAMILY="rhel" ;;
+          *arch*) DISTRO_FAMILY="arch" ;;
+          *suse*) DISTRO_FAMILY="suse" ;;
+          *alpine*) DISTRO_FAMILY="alpine" ;;
+          *) DISTRO_FAMILY="unknown" ;;
+        esac
+      fi
+      # WSL detection (informational)
+      if grep -qi microsoft /proc/version 2>/dev/null; then
+        info "Detected WSL — installation will proceed on the Linux side."
+      fi
+      ;;
+    Darwin*) OS="macos" ;;
+    FreeBSD*|OpenBSD*|NetBSD*)
+      err "BSD detected. Etteum Pool is tested on Linux/macOS/Windows only — proceed at your own risk."
+      OS="linux"  # try anyway; pkg managers differ but Bun & Python work
+      ;;
+    *)
+      err "Unsupported OS: $(uname -s). Use install.ps1 on Windows."
+      exit 1
+      ;;
   esac
 }
-
-OS=$(detect_os)
-if [[ "$OS" == "unsupported" ]]; then
-  err "Unsupported OS: $(uname -s). Use install.ps1 on Windows."
-  exit 1
-fi
-
-have() { command -v "$1" >/dev/null 2>&1; }
+detect_os
 
 # Initialise PYTHON_BIN so it's always defined
 PYTHON_BIN=""
+PROJECT_DIR=""
 
+# ── Pretty banner & summary ───────────────────────────────────────────
 show_summary() {
   printf "\n${C_BOLD}${C_BLUE}Etteum Pool${C_RESET} — AI Proxy Pool for Multiple Providers\n\n"
 
-  # Check what needs to be installed
   local needs_git=false needs_bun=false needs_python=false
   local total_size=0
   local items=()
@@ -58,22 +92,24 @@ show_summary() {
   have bun || { needs_bun=true; items+=("  • Bun runtime                  ~50 MB"); ((total_size += 50)); }
 
   local has_python=false
-  for cand in python3.12 python3.11 python3.10 python3; do
+  for cand in python3.13 python3.12 python3.11 python3.10 python3; do
     if have "$cand"; then
       has_python=true
       break
     fi
   done
-  $has_python || { needs_python=true; items+=("  • Python 3.11+                 ~100 MB"); ((total_size += 100)); }
+  $has_python || { needs_python=true; items+=("  • Python 3.10+                 ~100 MB"); ((total_size += 100)); }
 
   items+=("  • Node.js dependencies         ~200 MB")
   ((total_size += 200))
   items+=("  • Python packages (venv)       ~150 MB")
   ((total_size += 150))
-  items+=("  • Playwright Chromium          ~175 MB")
-  ((total_size += 175))
-  items+=("  • Camoufox browser             ~150 MB")
-  ((total_size += 150))
+  if [[ "${ETTEUM_SKIP_BROWSERS:-0}" != "1" ]]; then
+    items+=("  • Playwright Chromium          ~175 MB")
+    ((total_size += 175))
+    items+=("  • Camoufox browser             ~150 MB")
+    ((total_size += 150))
+  fi
   items+=("  • Dashboard build              ~50 MB")
   ((total_size += 50))
 
@@ -84,11 +120,27 @@ show_summary() {
   printf "\n"
   printf "${C_BOLD}Estimated total size:${C_RESET} ~%d MB\n" "$total_size"
   printf "${C_BOLD}Install location:${C_RESET}     %s\n" "$INSTALL_DIR_DEFAULT"
+  if [[ "$OS" == "linux" ]]; then
+    printf "${C_BOLD}Distro family:${C_RESET}        %s\n" "${DISTRO_FAMILY:-unknown}"
+  fi
   printf "\n"
 
   if $needs_git || $needs_bun || $needs_python; then
     printf "${C_YELLOW}Note:${C_RESET} System dependencies (Git/Bun/Python) will be installed via package manager.\n"
     printf "      This may require ${C_BOLD}sudo${C_RESET} password.\n\n"
+  fi
+
+  if [[ "$ASSUME_YES" == "1" ]]; then
+    printf "${C_DIM}ETTEUM_YES=1 set — skipping confirmation.${C_RESET}\n\n"
+    return
+  fi
+
+  # If stdin isn't a tty (e.g. piped from curl), default to yes — otherwise the
+  # script just hangs on `read`. Users opt out by exporting ETTEUM_YES=0 and
+  # running the script from a terminal.
+  if [[ ! -t 0 ]]; then
+    printf "${C_DIM}Stdin is not a TTY (piped install) — proceeding automatically.${C_RESET}\n\n"
+    return
   fi
 
   printf "Do you want to continue? [Y/n] "
@@ -99,24 +151,46 @@ show_summary() {
   printf "\n"
 }
 
+# ── Tool installers (idempotent) ──────────────────────────────────────
+
+ensure_basics() {
+  # curl + unzip are required for Bun's installer
+  local missing=()
+  have curl  || missing+=(curl)
+  have unzip || missing+=(unzip)
+
+  if [[ ${#missing[@]} -eq 0 ]]; then return; fi
+  step "Installing prerequisites: ${missing[*]}"
+  case "$OS:$DISTRO_FAMILY" in
+    macos:*)    have brew && brew install "${missing[@]}" ;;
+    linux:debian) sudo apt-get update -y && sudo apt-get install -y "${missing[@]}" ;;
+    linux:rhel)   sudo dnf install -y "${missing[@]}" || sudo yum install -y "${missing[@]}" ;;
+    linux:arch)   sudo pacman -S --noconfirm "${missing[@]}" ;;
+    linux:suse)   sudo zypper -n install "${missing[@]}" ;;
+    linux:alpine) sudo apk add --no-cache "${missing[@]}" ;;
+    *) err "Install ${missing[*]} manually for your distro and re-run."; exit 1 ;;
+  esac
+}
+
 ensure_git() {
-  if have git; then return; fi
+  if have git; then ok "Git $(git --version | awk '{print $3}') already installed"; return; fi
   step "Installing git"
-  if [[ "$OS" == "macos" ]]; then
-    if have brew; then brew install git; else
-      err "Install Homebrew first: https://brew.sh"; exit 1
-    fi
-  else
-    if have apt-get; then sudo apt-get update && sudo apt-get install -y git
-    elif have dnf; then sudo dnf install -y git
-    elif have pacman; then sudo pacman -S --noconfirm git
-    else err "Install git manually for your distro"; exit 1
-    fi
-  fi
-  if ! have git; then
-    err "git installation finished but 'git' is not on PATH."
-    exit 1
-  fi
+  case "$OS:$DISTRO_FAMILY" in
+    macos:*)
+      if have brew; then brew install git
+      else
+        info "Triggering Apple's CLT installer (will pop a GUI dialog)..."
+        xcode-select --install 2>/dev/null || true
+        err "Install git via Xcode Command-Line Tools or Homebrew, then re-run."; exit 1
+      fi ;;
+    linux:debian) sudo apt-get update -y && sudo apt-get install -y git ;;
+    linux:rhel)   sudo dnf install -y git || sudo yum install -y git ;;
+    linux:arch)   sudo pacman -S --noconfirm git ;;
+    linux:suse)   sudo zypper -n install git ;;
+    linux:alpine) sudo apk add --no-cache git ;;
+    *) err "Install git manually for your distro"; exit 1 ;;
+  esac
+  if ! have git; then err "git installation finished but 'git' is not on PATH."; exit 1; fi
   ok "Git installed"
 }
 
@@ -126,23 +200,28 @@ ensure_bun() {
     return
   fi
   step "Installing Bun"
-  curl -fsSL https://bun.sh/install | bash >/dev/null
-  export BUN_INSTALL="$HOME/.bun"
+  if ! curl -fsSL https://bun.sh/install | bash; then
+    err "Bun install failed. Check network connectivity and re-run."
+    exit 1
+  fi
+  export BUN_INSTALL="${BUN_INSTALL:-$HOME/.bun}"
   export PATH="$BUN_INSTALL/bin:$PATH"
   if ! have bun; then
-    err "Bun installation finished but 'bun' is not on PATH. Open a new shell and re-run."
+    err "Bun installation finished but 'bun' is not on PATH."
+    info "Add to PATH manually: export PATH=\"\$HOME/.bun/bin:\$PATH\""
+    info "Then re-run this installer."
     exit 1
   fi
   ok "Bun $(bun --version) installed"
 }
 
 ensure_python() {
-  for cand in python3.12 python3.11 python3.10 python3; do
+  for cand in python3.13 python3.12 python3.11 python3.10 python3; do
     if have "$cand"; then
       PYTHON_BIN="$cand"
-      local ver
+      local ver major minor
       ver=$("$cand" -c 'import sys;print("%d.%d"%sys.version_info[:2])' 2>/dev/null || echo "0.0")
-      local major minor; IFS=. read -r major minor <<<"$ver"
+      IFS=. read -r major minor <<<"$ver"
       if [[ "$major" -ge 3 && "$minor" -ge 10 ]]; then
         ok "Python $ver found ($cand)"
         return
@@ -150,41 +229,50 @@ ensure_python() {
     fi
   done
   step "Installing Python 3.11+"
-  if [[ "$OS" == "macos" ]]; then
-    if have brew; then brew install python@3.11; PYTHON_BIN=python3.11
-    else err "Install Python 3.10+ manually (or install Homebrew)"; exit 1
-    fi
-  else
-    if have apt-get; then sudo apt-get update && sudo apt-get install -y python3 python3-venv python3-pip; PYTHON_BIN=python3
-    elif have dnf; then sudo dnf install -y python3 python3-pip; PYTHON_BIN=python3
-    elif have pacman; then sudo pacman -S --noconfirm python python-pip; PYTHON_BIN=python3
-    else err "Install Python 3.10+ manually for your distro"; exit 1
-    fi
-  fi
+  case "$OS:$DISTRO_FAMILY" in
+    macos:*)
+      if have brew; then brew install python@3.11 && PYTHON_BIN=python3.11
+      else err "Install Python 3.10+ manually (or install Homebrew: https://brew.sh)"; exit 1
+      fi ;;
+    linux:debian)
+      sudo apt-get update -y && sudo apt-get install -y python3 python3-venv python3-pip
+      PYTHON_BIN=python3 ;;
+    linux:rhel)
+      sudo dnf install -y python3 python3-pip || sudo yum install -y python3 python3-pip
+      PYTHON_BIN=python3 ;;
+    linux:arch)
+      sudo pacman -S --noconfirm python python-pip; PYTHON_BIN=python3 ;;
+    linux:suse)
+      sudo zypper -n install python3 python3-pip python3-venv; PYTHON_BIN=python3 ;;
+    linux:alpine)
+      sudo apk add --no-cache python3 py3-pip py3-virtualenv; PYTHON_BIN=python3 ;;
+    *) err "Install Python 3.10+ manually for your distro"; exit 1 ;;
+  esac
   if [[ -z "$PYTHON_BIN" ]] || ! have "$PYTHON_BIN"; then
-    err "Python installation failed — '$PYTHON_BIN' not found on PATH."
+    err "Python installation finished but '$PYTHON_BIN' is not on PATH."
     exit 1
   fi
   ok "Python $($PYTHON_BIN --version 2>&1) installed"
 }
 
-# On Debian/Ubuntu, python3-venv is a separate package.
-# If `python3 -m venv` fails, try to install it.
+# Debian/Ubuntu ship `python3 -m venv` as a separate package.
 ensure_venv_module() {
   if "$PYTHON_BIN" -m venv --help >/dev/null 2>&1; then return; fi
   step "Installing python3-venv package"
-  if have apt-get; then
-    sudo apt-get update && sudo apt-get install -y python3-venv
+  if [[ "$DISTRO_FAMILY" == "debian" ]]; then
+    sudo apt-get update -y && sudo apt-get install -y python3-venv
   fi
   if ! "$PYTHON_BIN" -m venv --help >/dev/null 2>&1; then
-    err "Python venv module is not available. Install 'python3-venv' for your distro and re-run."
+    err "Python venv module is not available. Install 'python3-venv' (or virtualenv) for your distro and re-run."
     exit 1
   fi
   ok "python3-venv installed"
 }
 
+# ── Repo & config ─────────────────────────────────────────────────────
+
 clone_or_update_repo() {
-  if [[ -f "package.json" ]] && grep -q '"name": "etteum-pool"' package.json 2>/dev/null; then
+  if [[ -f "package.json" ]] && grep -q '"name": *"etteum-pool"' package.json 2>/dev/null; then
     PROJECT_DIR="$(pwd)"
     step "Using existing checkout: $PROJECT_DIR"
     if [[ -d ".git" ]]; then
@@ -200,8 +288,8 @@ clone_or_update_repo() {
     (cd "$PROJECT_DIR" && git pull --ff-only) || warn "git pull failed"
   else
     PROJECT_DIR="$INSTALL_DIR_DEFAULT"
-    step "Cloning $REPO_URL → $PROJECT_DIR"
-    git clone --depth=1 "$REPO_URL" "$PROJECT_DIR"
+    step "Cloning $REPO_URL → $PROJECT_DIR (branch: $BRANCH)"
+    git clone --depth=1 --branch "$BRANCH" "$REPO_URL" "$PROJECT_DIR"
   fi
   cd "$PROJECT_DIR"
 }
@@ -241,23 +329,37 @@ write_env_if_missing() {
     fi
   fi
 
+  # Auto-rotate API_KEY off the default if user kept the placeholder
+  local current_api
+  current_api=$(grep '^API_KEY=' .env 2>/dev/null | cut -d= -f2- || echo "")
+  if [[ "$current_api" == "pool-proxy-secret-key" ]]; then
+    local new_api
+    if have openssl; then new_api=$(openssl rand -hex 24)
+    else new_api=$(head -c 24 /dev/urandom | od -An -tx1 | tr -d ' \n')
+    fi
+    if [[ "$OS" == "macos" ]]; then
+      sed -i '' "s|^API_KEY=.*|API_KEY=$new_api|" .env
+    else
+      sed -i "s|^API_KEY=.*|API_KEY=$new_api|" .env
+    fi
+    ok "Generated random API_KEY"
+    info "  Your API key: $new_api"
+    info "  Clients send this as: Authorization: Bearer <api_key>"
+  fi
+
   # Ensure PYTHON_PATH is empty (auto-detect) or correct for this OS
   if ! grep -q '^PYTHON_PATH=' .env; then
     echo "PYTHON_PATH=" >> .env
     info "Added PYTHON_PATH= (auto-detect)"
   else
-    # If it has a Windows path on Linux or vice versa, clear it for auto-detect
     local py_path
     py_path=$(grep '^PYTHON_PATH=' .env | cut -d= -f2- || echo "")
-    if [[ -n "$py_path" ]]; then
-      # Check if the configured path actually exists
-      if [[ ! -x "$py_path" ]] && [[ ! -f "$py_path" ]]; then
-        warn "PYTHON_PATH=$py_path does not exist — clearing for auto-detect"
-        if [[ "$OS" == "macos" ]]; then
-          sed -i '' "s|^PYTHON_PATH=.*|PYTHON_PATH=|" .env
-        else
-          sed -i "s|^PYTHON_PATH=.*|PYTHON_PATH=|" .env
-        fi
+    if [[ -n "$py_path" ]] && [[ ! -x "$py_path" ]] && [[ ! -f "$py_path" ]]; then
+      warn "PYTHON_PATH=$py_path does not exist — clearing for auto-detect"
+      if [[ "$OS" == "macos" ]]; then
+        sed -i '' "s|^PYTHON_PATH=.*|PYTHON_PATH=|" .env
+      else
+        sed -i "s|^PYTHON_PATH=.*|PYTHON_PATH=|" .env
       fi
     fi
   fi
@@ -273,30 +375,43 @@ write_env_if_missing() {
   done
 }
 
+# ── Heavy steps with retry ────────────────────────────────────────────
+
+# Run cmd up to 3 times with exponential backoff. Useful for flaky network steps.
+retry() {
+  local n=0 max=3 delay=3
+  while true; do
+    if "$@"; then return 0; fi
+    n=$((n + 1))
+    if [[ $n -ge $max ]]; then return 1; fi
+    warn "Command failed (attempt $n/$max). Retrying in ${delay}s..."
+    sleep "$delay"
+    delay=$((delay * 2))
+  done
+}
+
 install_node_deps() {
   step "Installing JS dependencies"
-
-  # Verify bun is available
   if ! have bun; then
-    export BUN_INSTALL="$HOME/.bun"
+    export BUN_INSTALL="${BUN_INSTALL:-$HOME/.bun}"
     export PATH="$BUN_INSTALL/bin:$PATH"
     if ! have bun; then
-      err "bun is not on PATH. Please open a new terminal and re-run the installer."
+      err "bun is not on PATH. Open a new terminal and re-run the installer."
       exit 1
     fi
   fi
 
   info "Installing root dependencies..."
-  if ! bun install; then
+  if ! retry bun install; then
     err "bun install failed in project root"
-    info "Try running manually: cd $PROJECT_DIR && bun install"
+    info "Try manually: cd $PROJECT_DIR && bun install"
     exit 1
   fi
 
   info "Installing dashboard dependencies..."
-  if ! (cd dashboard && bun install); then
+  if ! retry bash -c "cd dashboard && bun install"; then
     err "bun install failed in dashboard/"
-    info "Try running manually: cd $PROJECT_DIR/dashboard && bun install"
+    info "Try manually: cd $PROJECT_DIR/dashboard && bun install"
     exit 1
   fi
 
@@ -309,8 +424,6 @@ setup_python_venv() {
   local venv_python="$venv_dir/bin/python"
 
   step "Setting up Python venv at $venv_dir"
-
-  # Ensure venv module is available (Debian/Ubuntu need python3-venv)
   ensure_venv_module
 
   if [[ ! -d "$venv_dir" ]]; then
@@ -323,14 +436,11 @@ setup_python_venv() {
     fi
   fi
 
-  # Validate venv was created correctly
   if [[ ! -f "$venv_python" ]]; then
     err "Python venv created but $venv_python not found!"
-    info "Expected: $venv_dir/bin/python"
     info "Try deleting $venv_dir and re-running the installer."
     exit 1
   fi
-
   if [[ ! -f "$pip" ]]; then
     err "Python venv created but pip not found at $pip"
     info "Try deleting $venv_dir and re-running the installer."
@@ -338,19 +448,26 @@ setup_python_venv() {
   fi
 
   info "Upgrading pip..."
-  "$pip" install --upgrade pip wheel 2>&1 | tail -1
+  retry "$pip" install --upgrade pip wheel >/dev/null 2>&1 || warn "pip upgrade failed (continuing)"
 
   info "Installing Python packages (this may take a minute)..."
-  if ! "$pip" install -r scripts/auth/requirements.txt 2>&1 | tail -5; then
+  if ! retry "$pip" install -r scripts/auth/requirements.txt; then
     err "pip install failed"
     info "Try manually: $pip install -r scripts/auth/requirements.txt"
+    info "If you're behind a corporate proxy, set HTTPS_PROXY before re-running."
     exit 1
   fi
   ok "Python deps installed"
 
+  if [[ "${ETTEUM_SKIP_BROWSERS:-0}" == "1" ]]; then
+    warn "ETTEUM_SKIP_BROWSERS=1 — skipping Playwright/Camoufox download."
+    warn "  Auth bot will fail until you run: $venv_python -m playwright install chromium && $venv_python -m camoufox fetch"
+    return
+  fi
+
   step "Installing browsers (Playwright + Camoufox — this can take a few minutes)"
   info "Installing Playwright Chromium..."
-  if "$venv_python" -m playwright install chromium 2>&1 | tail -3; then
+  if retry "$venv_python" -m playwright install chromium; then
     ok "Playwright Chromium installed"
   else
     warn "Playwright Chromium install failed (you can re-run later)"
@@ -358,7 +475,7 @@ setup_python_venv() {
   fi
 
   info "Fetching Camoufox browser..."
-  if "$venv_python" -m camoufox fetch 2>&1 | tail -3; then
+  if retry "$venv_python" -m camoufox fetch; then
     ok "Camoufox browser installed"
   else
     warn "Camoufox fetch failed (you can re-run later)"
@@ -368,7 +485,7 @@ setup_python_venv() {
 
 build_dashboard() {
   step "Building dashboard (production)"
-  if ! (cd dashboard && bun run build); then
+  if ! retry bash -c "cd dashboard && bun run build"; then
     err "Dashboard build failed"
     info "Try manually: cd $PROJECT_DIR/dashboard && bun run build"
     exit 1
@@ -378,6 +495,7 @@ build_dashboard() {
 
 run_migrations() {
   step "Running database migrations"
+  mkdir -p "$PROJECT_DIR/data"
   if bun src/db/migrate.ts 2>&1; then
     ok "Migrations applied"
   else
@@ -387,27 +505,46 @@ run_migrations() {
 }
 
 install_cli_symlink() {
+  if [[ "${ETTEUM_NO_CLI:-0}" == "1" ]]; then
+    warn "ETTEUM_NO_CLI=1 — skipping CLI symlink"
+    return
+  fi
   step "Installing CLI commands"
   local target="$HOME/.local/bin"
   mkdir -p "$target"
-
-  # Link etteum command
   ln -sf "$PROJECT_DIR/etteum" "$target/etteum"
   chmod +x "$PROJECT_DIR/etteum"
-
   ok "Linked $target/etteum -> $PROJECT_DIR/etteum"
 
   case ":$PATH:" in
     *":$target:"*) ;;
-    *) warn "Add to PATH: export PATH=\"$target:\$PATH\"" ;;
+    *)
+      warn "$target is not on your PATH."
+      info "Add this to your shell rc file (~/.bashrc, ~/.zshrc, ~/.config/fish/config.fish):"
+      info "  export PATH=\"\$HOME/.local/bin:\$PATH\""
+      ;;
   esac
 }
 
+run_preflight() {
+  step "Running preflight check"
+  if bun scripts/preflight.ts; then
+    return 0
+  else
+    warn "Preflight reported issues — see above. The server may still start."
+    info "Run \`etteum doctor\` for a detailed report."
+    return 1
+  fi
+}
+
+# ── Main ──────────────────────────────────────────────────────────────
+
 main() {
-  printf "\n${C_BOLD}${C_BLUE}Etteum Pool Installer${C_RESET}  ${C_DIM}(%s)${C_RESET}\n" "$OS"
+  printf "\n${C_BOLD}${C_BLUE}Etteum Pool Installer${C_RESET}  ${C_DIM}(%s%s)${C_RESET}\n" "$OS" "${DISTRO_FAMILY:+/$DISTRO_FAMILY}"
 
   show_summary
 
+  ensure_basics
   ensure_git
   ensure_bun
   ensure_python
@@ -422,6 +559,7 @@ main() {
   build_dashboard
   run_migrations
   install_cli_symlink
+  run_preflight || true
 
   printf "\n${C_GREEN}${C_BOLD}✓ Installation complete!${C_RESET}\n\n"
   printf "Etteum Pool is installed at: ${C_BOLD}%s${C_RESET}\n\n" "$PROJECT_DIR"
@@ -431,21 +569,31 @@ ${C_BOLD}Quick Start:${C_RESET}
 
   1. Start the server:
      ${C_CYAN}etteum start${C_RESET}
-     or: cd $PROJECT_DIR && ./etteum start
+     ${C_DIM}(or: cd $PROJECT_DIR && ./etteum start)${C_RESET}
 
   2. Open the dashboard:
      ${C_CYAN}http://localhost:1931${C_RESET}
 
-  3. Add accounts via the dashboard UI
+  3. Add accounts via the dashboard UI (or bring your own keys via BYOK)
 
 ${C_BOLD}Useful Commands:${C_RESET}
 
-  etteum status     # Check server status
-  etteum logs       # View server logs
-  etteum stop       # Stop the server
-  etteum restart    # Restart the server
+  etteum status     Check server status
+  etteum logs       Tail server logs
+  etteum stop       Stop the server
+  etteum restart    Restart the server
+  etteum doctor     Diagnose installation health
+  etteum update     Pull latest, rebuild, restart
+  etteum help       Full command reference
+
+${C_BOLD}Files of interest:${C_RESET}
+
+  $PROJECT_DIR/.env             Configuration (API_KEY, ports, encryption)
+  $PROJECT_DIR/data/            SQLite database & uploads
+  $PROJECT_DIR/.etteum.log      Server logs
 
 ${C_DIM}Tip: re-run this installer any time to pull updates and rebuild.${C_RESET}
+${C_DIM}Tip: trouble? run \`etteum doctor\` to get a checklist of fixes.${C_RESET}
 EOF
 }
 
