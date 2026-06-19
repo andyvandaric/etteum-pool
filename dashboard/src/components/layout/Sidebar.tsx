@@ -21,6 +21,7 @@ import {
   Moon,
   ChevronLeft,
   ChevronRight,
+  RefreshCw,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { useTheme } from "@/hooks/useTheme";
@@ -50,6 +51,7 @@ const navSections: NavSection[] = [
     title: "TOOLS",
     items: [
       { label: "Image Studio", path: "/image-studio", icon: Sparkles },
+      { label: "Combo Fallback", path: "/combo", icon: RefreshCw },
       { label: "Integration", path: "/integration", icon: Plug },
     ],
   },

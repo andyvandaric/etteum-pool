@@ -151,7 +151,7 @@ async function main() {
         .from(accounts)
         .where(and(eq(accounts.provider, ETTEUM_PROVIDER), eq(accounts.email, email)));
 
-      if (existing.length > 0) {
+      if (existing.length > 0 && existing[0]) {
         // Update existing
         await db.update(accounts).set({
           tokens,

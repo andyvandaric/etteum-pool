@@ -9,6 +9,15 @@ import {
   getCompressionConfig,
   type CompressionStats,
 } from "./compression";
+import {
+  findComboForModel,
+  shouldComboRetry,
+  isComboModel,
+  isStepCooledDown,
+  recordStepFailure,
+  recordStepSuccess,
+  type ComboRule,
+} from "./combo";
 
 export interface RouteResult {
   result: ProviderResult;
@@ -16,6 +25,14 @@ export interface RouteResult {
   provider: ProviderName;
   durationMs: number;
   compressionStats?: CompressionStats;
+  comboInfo?: {
+    ruleName: string;
+    originalModel: string;
+    usedStep: number;
+    usedProvider: string;
+    usedModel: string;
+    attemptedSteps: string[];
+  };
 }
 
 /** Check if a request contains image content blocks */
@@ -87,30 +104,24 @@ function sanitizeRequest(request: ChatCompletionRequest): ChatCompletionRequest 
   return sanitized;
 }
 
-/**
- * Route a chat completion request to the appropriate provider/account.
- * Implements retry logic with fallback to next account.
- */
-export async function routeRequest(
-  request: ChatCompletionRequest,
-  stream: boolean
+// ---------------------------------------------------------------------------
+// tryProvider — attempt a request against a single provider+model
+// ---------------------------------------------------------------------------
+
+async function tryProvider(
+  sanitizedRequest: ChatCompletionRequest,
+  targetModel: string,
+  providerName: ProviderName,
+  stream: boolean,
 ): Promise<RouteResult> {
-  // Apply content filters to strip Claude Code identity, billing headers, etc.
-  const sanitizedRequest = sanitizeRequest(request);
-
   const hasImages = requestHasImages(sanitizedRequest);
-  const providerName = pool.getProviderForModel(sanitizedRequest.model);
-  if (!providerName) {
-    throw new Error(`No provider found for model: ${sanitizedRequest.model}`);
-  }
+  const modelRequest = { ...sanitizedRequest, model: targetModel };
 
-  // Apply compression pipeline (RTK + DCP + Caveman + image dedupe + cache markers).
-  // Failures here are non-fatal — fall back to the sanitized request and move on.
-  let compressedRequest = sanitizedRequest;
+  let compressedRequest = modelRequest;
   let compressionStats: CompressionStats | undefined;
   try {
     const cfg = await getCompressionConfig();
-    const out = compressRequest(sanitizedRequest, cfg, providerName);
+    const out = compressRequest(modelRequest, cfg, providerName);
     compressedRequest = out.request;
     compressionStats = out.stats;
   } catch (err) {
@@ -122,24 +133,20 @@ export async function routeRequest(
     throw new Error(`Provider not configured: ${providerName}`);
   }
 
-  // Reject image requests for models that don't support vision
   if (hasImages) {
-    const modelInfo = provider.getModelInfo(sanitizedRequest.model);
+    const modelInfo = provider.getModelInfo(targetModel);
     if (modelInfo && !modelInfo.vision) {
       throw new Error(
-        `Model "${sanitizedRequest.model}" does not support image/vision inputs. Use a vision-capable model instead.`
+        `Model "${targetModel}" does not support image/vision inputs. Use a vision-capable model instead.`
       );
     }
   }
 
-  // Try up to 3 accounts before giving up
   const maxRetries = 3;
   let lastError = "";
   const attemptedByokAccountIds = new Set<number>();
 
   for (let attempt = 0; attempt < maxRetries; attempt++) {
-    // BYOK uses prefix-based account lookup (not the generic pool),
-    // so it can also find error-status accounts and retry them.
     const account = providerName === "byok"
       ? (await pool.getAccountForModel(compressedRequest.model, {
           excludeAccountIds: attemptedByokAccountIds,
@@ -165,7 +172,6 @@ export async function routeRequest(
       const durationMs = Date.now() - startTime;
 
       if (result.success) {
-        // If provider refreshed tokens internally, persist them to database
         if (result.tokens) {
           await pool.updateTokens(account.id, result.tokens);
         }
@@ -176,41 +182,27 @@ export async function routeRequest(
       pool.trackRequestEnd(account.id);
       tracked = false;
 
-      // Client-side model errors should not poison accounts. A wrong model ID
-      // is a bad request, not an account/session failure, so stop retrying and
-      // let the API layer return an invalid_model response.
       if (isNonAccountRequestError(result.error)) {
         throw new Error(result.error || `Invalid model: ${compressedRequest.model}`);
       }
 
-      // Handle rate limiting (429) — temporary, don't mark exhausted
       if (result.rateLimited) {
         lastError = result.error || "Rate limited";
-        continue; // Try next account without poisoning this one
+        continue;
       }
 
-      // Handle quota exhaustion (402 / 403 without PAYG).
-      //
-      // Trust upstream: if the provider reports quota exhausted, mark it
-      // and move on. For Qoder, the next warmup tick will re-fetch
-      // /activity and /quota/usage and flip the account back to active
-      // automatically if Qoder reports remaining > 0 again. We accept the
-      // occasional false-exhaust (lifted within one warmup cycle) in
-      // exchange for never serving a known-bad account on retry.
       if (result.quotaExhausted) {
         await pool.markExhausted(account.id);
         lastError = result.error || "Quota exhausted";
-        continue; // Try next account
+        continue;
       }
 
-      // Handle token refresh
       if (
         result.error?.includes("expired") ||
         result.error?.includes("401")
       ) {
         const refreshResult = await provider.refreshToken(account);
         if (refreshResult.success && refreshResult.tokens) {
-          // Parse tokens string to store as jsonb
           let parsedTokens: unknown;
           try {
             parsedTokens = JSON.parse(refreshResult.tokens);
@@ -218,7 +210,6 @@ export async function routeRequest(
             parsedTokens = refreshResult.tokens;
           }
           await pool.updateTokens(account.id, parsedTokens);
-          // Retry with same account after refresh
           pool.trackRequestStart(account.id);
           tracked = true;
           const retryResult = stream
@@ -243,7 +234,6 @@ export async function routeRequest(
         continue;
       }
 
-      // Generic error - check if transient (network/timeout) or permanent
       if (isTransientError(result.error || "")) {
         await pool.markTransientFailure(account.id, result.error || "Transient error");
       } else {
@@ -273,6 +263,245 @@ export async function routeRequest(
 
   throw new Error(
     `All accounts failed for ${providerName}. Last error: ${lastError}`
+  );
+}
+
+// ---------------------------------------------------------------------------
+// routeRequest — main entry point with combo fallback
+// ---------------------------------------------------------------------------
+
+/** Per-step timeout for combo chain (30 seconds per step). */
+const COMBO_STEP_TIMEOUT_MS = 30_000;
+
+/** Wrap a promise with a timeout. */
+function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(`Timeout after ${ms}ms: ${label}`)), ms);
+    promise.then(
+      (v) => { clearTimeout(timer); resolve(v); },
+      (e) => { clearTimeout(timer); reject(e); },
+    );
+  });
+}
+
+/**
+ * Route a chat completion request to the appropriate provider/account.
+ * Implements retry logic with fallback to next account, and combo
+ * (multi-provider+model) fallback when a combo rule matches.
+ */
+export async function routeRequest(
+  request: ChatCompletionRequest,
+  stream: boolean
+): Promise<RouteResult> {
+  const sanitizedRequest = sanitizeRequest(request);
+  const originalModel = sanitizedRequest.model;
+
+  // Check if this is a combo virtual model (exact match)
+  const directCombo = isComboModel(originalModel);
+  if (directCombo) {
+    return runComboChain(sanitizedRequest, originalModel, directCombo, stream, []);
+  }
+
+  // Normal routing: find provider for this model
+  const providerName = pool.getProviderForModel(originalModel);
+  if (!providerName) {
+    throw new Error(`No provider found for model: ${originalModel}`);
+  }
+
+  // First attempt: original provider + model
+  try {
+    return await tryProvider(sanitizedRequest, originalModel, providerName, stream);
+  } catch (primaryError) {
+    const primaryMsg = primaryError instanceof Error ? primaryError.message : String(primaryError);
+
+    // Content/model errors should not trigger combo fallback
+    if (isNonAccountRequestError(primaryMsg)) {
+      throw primaryError;
+    }
+
+    // Combo fallback (pattern match)
+    const comboRule = findComboForModel(originalModel);
+    if (!comboRule || comboRule.steps.length === 0) {
+      throw primaryError;
+    }
+
+    const maxSteps = comboRule.maxRetries > 0
+      ? Math.min(comboRule.maxRetries, comboRule.steps.length)
+      : comboRule.steps.length;
+
+    const attemptedSteps: string[] = [`${providerName}/${originalModel}`];
+
+    console.log(
+      `[Combo] Primary provider ${providerName}/${originalModel} failed: ${primaryMsg}. ` +
+      `Trying combo "${comboRule.name}" (${maxSteps} steps)...`
+    );
+
+    let lastComboError = primaryMsg;
+
+    for (let i = 0; i < maxSteps; i++) {
+      const step = comboRule.steps[i]!;
+
+      if (step.provider === providerName && step.model === originalModel) {
+        continue;
+      }
+
+      if (!shouldComboRetry(comboRule, lastComboError)) {
+        console.log(`[Combo] Error type not retryable for rule "${comboRule.name}", stopping.`);
+        break;
+      }
+
+      const stepProvider = step.provider as ProviderName;
+      if (!providers[stepProvider]) {
+        console.warn(`[Combo] Unknown provider "${step.provider}" in step ${i}, skipping.`);
+        continue;
+      }
+
+      if (isStepCooledDown(step.provider, step.model)) {
+        console.log(`[Combo] Step ${i + 1} (${step.provider}/${step.model}) is in cooldown, skipping.`);
+        continue;
+      }
+
+      const hasAccounts = await pool.hasActiveAccounts(stepProvider);
+      if (!hasAccounts) {
+        console.log(`[Combo] Step ${i + 1} (${step.provider}/${step.model}) has no active accounts, skipping.`);
+        continue;
+      }
+
+      attemptedSteps.push(`${step.provider}/${step.model}`);
+      console.log(`[Combo] Step ${i + 1}/${maxSteps}: trying ${step.provider}/${step.model}...`);
+
+      try {
+        const result = await withTimeout(
+          tryProvider(sanitizedRequest, step.model, stepProvider, stream),
+          COMBO_STEP_TIMEOUT_MS,
+          `${step.provider}/${step.model}`,
+        );
+
+        recordStepSuccess(step.provider, step.model);
+
+        result.comboInfo = {
+          ruleName: comboRule.name,
+          originalModel,
+          usedStep: i,
+          usedProvider: step.provider,
+          usedModel: step.model,
+          attemptedSteps,
+        };
+
+        console.log(
+          `[Combo] Success on step ${i + 1} (${step.provider}/${step.model}) ` +
+          `after ${attemptedSteps.length} attempts.`
+        );
+
+        return result;
+      } catch (stepError) {
+        lastComboError = stepError instanceof Error ? stepError.message : String(stepError);
+        console.log(`[Combo] Step ${i + 1} failed: ${lastComboError}`);
+
+        recordStepFailure(step.provider, step.model);
+
+        if (isNonAccountRequestError(lastComboError)) {
+          continue;
+        }
+      }
+    }
+
+    throw new Error(
+      `Combo "${comboRule.name}" exhausted all ${attemptedSteps.length} steps. ` +
+      `Tried: ${attemptedSteps.join(" -> ")}. Last error: ${lastComboError}`
+    );
+  }
+}
+
+// ---------------------------------------------------------------------------
+// runComboChain — used when the model IS a combo virtual model
+// ---------------------------------------------------------------------------
+
+async function runComboChain(
+  sanitizedRequest: ChatCompletionRequest,
+  originalModel: string,
+  comboRule: ComboRule,
+  stream: boolean,
+  priorSteps: string[],
+): Promise<RouteResult> {
+  const maxSteps = comboRule.maxRetries > 0
+    ? Math.min(comboRule.maxRetries, comboRule.steps.length)
+    : comboRule.steps.length;
+
+  const attemptedSteps: string[] = [...priorSteps];
+  let lastComboError = "";
+
+  console.log(
+    `[Combo] Direct combo model "${originalModel}" -> running chain "${comboRule.name}" (${maxSteps} steps)...`
+  );
+
+  for (let i = 0; i < maxSteps; i++) {
+    const step = comboRule.steps[i]!;
+    const stepProvider = step.provider as ProviderName;
+
+    if (!providers[stepProvider]) {
+      console.warn(`[Combo] Unknown provider "${step.provider}" in step ${i}, skipping.`);
+      continue;
+    }
+
+    if (isStepCooledDown(step.provider, step.model)) {
+      console.log(`[Combo] Step ${i + 1} (${step.provider}/${step.model}) is in cooldown, skipping.`);
+      continue;
+    }
+
+    const hasAccounts = await pool.hasActiveAccounts(stepProvider);
+    if (!hasAccounts) {
+      console.log(`[Combo] Step ${i + 1} (${step.provider}/${step.model}) has no active accounts, skipping.`);
+      continue;
+    }
+
+    attemptedSteps.push(`${step.provider}/${step.model}`);
+    console.log(`[Combo] Step ${i + 1}/${maxSteps}: trying ${step.provider}/${step.model}...`);
+
+    try {
+      const result = await withTimeout(
+        tryProvider(sanitizedRequest, step.model, stepProvider, stream),
+        COMBO_STEP_TIMEOUT_MS,
+        `${step.provider}/${step.model}`,
+      );
+
+      recordStepSuccess(step.provider, step.model);
+
+      result.comboInfo = {
+        ruleName: comboRule.name,
+        originalModel,
+        usedStep: i,
+        usedProvider: step.provider,
+        usedModel: step.model,
+        attemptedSteps,
+      };
+
+      console.log(
+        `[Combo] Success on step ${i + 1} (${step.provider}/${step.model}) ` +
+        `after ${attemptedSteps.length} attempts.`
+      );
+
+      return result;
+    } catch (stepError) {
+      lastComboError = stepError instanceof Error ? stepError.message : String(stepError);
+      console.log(`[Combo] Step ${i + 1} failed: ${lastComboError}`);
+
+      recordStepFailure(step.provider, step.model);
+
+      if (i > 0 && !shouldComboRetry(comboRule, lastComboError)) {
+        console.log(`[Combo] Error type not retryable, stopping.`);
+        break;
+      }
+
+      if (isNonAccountRequestError(lastComboError)) {
+        continue;
+      }
+    }
+  }
+
+  throw new Error(
+    `Combo "${comboRule.name}" exhausted all ${attemptedSteps.length} steps. ` +
+    `Tried: ${attemptedSteps.join(" -> ")}. Last error: ${lastComboError}`
   );
 }
 

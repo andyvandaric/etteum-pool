@@ -92,6 +92,15 @@ class AccountPool {
   }
 
   /**
+   * Quick check: does this provider have any active accounts available?
+   * Used by combo chain to skip providers that are fully exhausted.
+   */
+  async hasActiveAccounts(provider: ProviderName): Promise<boolean> {
+    const accounts = await this.getActiveAccounts(provider);
+    return accounts.length > 0;
+  }
+
+  /**
    * Get the next available account for a provider using configured method.
    */
   async getNextAccount(provider: ProviderName): Promise<Account | null> {

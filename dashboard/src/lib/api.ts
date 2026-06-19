@@ -850,3 +850,90 @@ export async function testByokProvider(
     body: JSON.stringify(model ? { model } : {})
   });
 }
+
+// --- Combo Fallback ---
+
+export interface ComboStep {
+  provider: string;
+  model: string;
+}
+
+export interface ComboRule {
+  id: number;
+  name: string;
+  modelId: string;
+  triggerModel: string;
+  matchType: "exact" | "contains" | "prefix";
+  steps: ComboStep[];
+  maxRetries: number;
+  retryOn: string[];
+  enabled: boolean;
+  priority: number;
+  createdAt: string;
+  updatedAt: string | null;
+}
+
+export interface ComboCooldown {
+  step: string;
+  failures: number;
+  cooledUntil: string | null;
+}
+
+export async function fetchComboRules(): Promise<{
+  data: ComboRule[];
+  enabled: boolean;
+  cooldowns: ComboCooldown[];
+}> {
+  return fetchApi("/api/combo");
+}
+
+export async function fetchComboModels(): Promise<{
+  data: Record<string, Array<{ id: string; name: string }>>;
+}> {
+  return fetchApi("/api/combo/models");
+}
+
+export async function createComboRule(rule: Partial<ComboRule>): Promise<{ data: ComboRule }> {
+  return fetchApi("/api/combo", {
+    method: "POST",
+    body: JSON.stringify(rule),
+  });
+}
+
+export async function updateComboRule(id: number, rule: Partial<ComboRule>): Promise<{ data: ComboRule }> {
+  return fetchApi(`/api/combo/${id}`, {
+    method: "PUT",
+    body: JSON.stringify(rule),
+  });
+}
+
+export async function deleteComboRule(id: number): Promise<{ success: boolean }> {
+  return fetchApi(`/api/combo/${id}`, { method: "DELETE" });
+}
+
+export async function toggleComboEnabled(enabled: boolean): Promise<{ enabled: boolean }> {
+  return fetchApi("/api/combo/toggle", {
+    method: "PUT",
+    body: JSON.stringify({ enabled }),
+  });
+}
+
+export async function testComboModel(model: string, prompt?: string): Promise<{
+  success: boolean;
+  durationMs: number;
+  provider: string;
+  content: string;
+  comboInfo: any;
+}> {
+  return fetchApi("/api/combo/test", {
+    method: "POST",
+    body: JSON.stringify({ model, prompt }),
+  });
+}
+
+export async function fetchComboStats(): Promise<{
+  data: any[];
+  recent: any[];
+}> {
+  return fetchApi("/api/combo/stats");
+}
